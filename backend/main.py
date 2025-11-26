@@ -56,6 +56,11 @@ async def startup_event():
     logger.info("FastAPI application started")
     logger.info(f"Log file: {log_file}")
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down, closing connections...")
+    await immich.close()
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """Serve the main app interface"""
@@ -321,13 +326,68 @@ async def root():
             color: var(--text-dim);
             font-size: 11px;
         }
+        
+        .header-controls {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        
+        .camera-filter {
+            position: relative;
+        }
+        
+        .camera-filter label {
+            color: var(--text-dim);
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-right: 8px;
+        }
+        
+        .camera-filter select {
+            background: var(--bg-light);
+            border: 1px solid var(--border);
+            color: var(--text);
+            font-family: inherit;
+            font-size: 11px;
+            padding: 4px 8px;
+            min-width: 200px;
+            max-width: 300px;
+            cursor: pointer;
+            max-height: 120px;
+        }
+        
+        .camera-filter select:focus {
+            outline: none;
+            border-color: var(--jade);
+        }
+        
+        .camera-filter select option {
+            background: var(--bg-light);
+            color: var(--text);
+            padding: 4px;
+        }
+        
+        .camera-filter select option:checked {
+            background: var(--jade-muted);
+            color: var(--jade-bright);
+        }
     </style>
 </head>
 <body>
     <div class="wrap">
         <div class="header">
             <div class="title">sorter <span>// immich</span></div>
-            <div class="queue-ct" id="queueInfo">queue: 0</div>
+            <div class="header-controls">
+                <div class="camera-filter">
+                    <label for="cameraSelect">camera:</label>
+                    <select id="cameraSelect" multiple size="4" title="hold ctrl/cmd to select multiple">
+                        <option value="">loading...</option>
+                    </select>
+                </div>
+                <div class="queue-ct" id="queueInfo">queue: 0</div>
+            </div>
         </div>
         
         <div class="main">
@@ -376,17 +436,8 @@ async def root():
         let imageQueue = []; // Queue of preloaded images
         const QUEUE_SIZE = 3; // Preload 3 images ahead
         let isPreloading = false;
-        const MAX_HISTORY = 10;
-        const historyEntries = [];
-        const ACTION_LABELS = {
-            'delete': 'del',
-            'keep': 'skip',
-            'fav': 'fav',
-            'archive': 'archive'
-        };
-        
-        let statusTimer = null;
-        let fadeTimer = null;
+        let selectedCameras = []; // Selected camera models for filtering
+        let seenAssetIds = new Set(); // Track seen assets to prevent duplicates
         
         function showStatus(message, type = 'info') {
             const status = document.getElementById('status');
@@ -532,13 +583,62 @@ async def root():
             }
         }
         
+        // Load available camera models
+        async function loadCameras() {
+            try {
+                const r = await fetch('/cameras');
+                const data = await r.json();
+                
+                if (data.error) {
+                    console.error('Error loading cameras:', data.error);
+                    return;
+                }
+                
+                const select = document.getElementById('cameraSelect');
+                select.innerHTML = '<option value="">all cameras</option>';
+                
+                if (data.cameras && data.cameras.length > 0) {
+                    data.cameras.forEach(camera => {
+                        const option = document.createElement('option');
+                        option.value = camera;
+                        option.textContent = camera;
+                        select.appendChild(option);
+                    });
+                } else {
+                    select.innerHTML = '<option value="">no cameras found</option>';
+                }
+            } catch (error) {
+                console.error('Error loading cameras:', error);
+            }
+        }
+        
+        // Handle camera filter change
+        function onCameraFilterChange() {
+            const select = document.getElementById('cameraSelect');
+            selectedCameras = Array.from(select.selectedOptions)
+                .map(opt => opt.value)
+                .filter(v => v); // Remove empty values
+            
+            // Clear queue and seen IDs when filter changes
+            imageQueue = [];
+            seenAssetIds.clear();
+            currentId = null;
+            currentAsset = null;
+            lastAction = null;  // Clear undo history too
+            loadNext();
+        }
+        
         // Preload next batch of images into queue
         async function preloadQueue() {
             if (isPreloading || imageQueue.length >= QUEUE_SIZE) return;
             
             isPreloading = true;
             try {
-                const r = await fetch(`/next?count=${QUEUE_SIZE}`);
+                let url = `/next?count=${QUEUE_SIZE}`;
+                if (selectedCameras.length > 0) {
+                    url += `&cameras=${encodeURIComponent(selectedCameras.join(','))}`;
+                }
+                const r = await fetch(url);
                 const data = await r.json();
                 
                 if (data.error) {
@@ -552,9 +652,15 @@ async def root():
                     return;
                 }
                 
-                // Add to queue and preload images
+                // Add to queue and preload images (deduplicate)
                 const assets = data.assets || [data];
                 for (const asset of assets) {
+                    // Skip if we've already seen this asset
+                    if (seenAssetIds.has(asset.id)) {
+                        continue;
+                    }
+                    seenAssetIds.add(asset.id);
+                    
                     // Preload thumbnail immediately
                     const thumbImg = new Image();
                     thumbImg.src = asset.thumb_url;
@@ -577,6 +683,7 @@ async def root():
             if (imageQueue.length > 0) {
                 const asset = imageQueue.shift();
                 currentId = asset.id;
+                currentAsset = asset;  // Store for undo
                 displayImage(asset);
                 
                 // Trigger background preload for more images
@@ -597,7 +704,11 @@ async def root():
             setLoading(true);
             
             try {
-                const r = await fetch('/next');
+                let url = '/next';
+                if (selectedCameras.length > 0) {
+                    url += `?cameras=${encodeURIComponent(selectedCameras.join(','))}`;
+                }
+                const r = await fetch(url);
                 const data = await r.json();
                 
                 if (data.error) {
@@ -611,11 +722,18 @@ async def root():
                     document.getElementById('photo').style.display = 'none';
                     document.getElementById('video').style.display = 'none';
                     currentId = null;
+                    currentAsset = null;
                     setLoading(false);
                     return;
                 }
                 
+                // Track seen asset
+                if (!seenAssetIds.has(data.id)) {
+                    seenAssetIds.add(data.id);
+                }
+                
                 currentId = data.id;
+                currentAsset = data;  // Store for undo
                 displayImage(data);
                 
                 // Start preloading queue for next images
@@ -626,14 +744,25 @@ async def root():
             }
         }
         
-        // Undo stack
+        // Undo stack - stores full asset data for restoration
         let lastAction = null;
+        let currentAsset = null;  // Store current asset for undo
         
         async function sendAction(action) {
-            if (!currentId) return;
+            if (!currentId || !currentAsset) return;
             
-            // Store for undo
-            lastAction = { id: currentId, action: action };
+            const actionNames = {
+                'delete': 'del',
+                'keep': 'skip',
+                'fav': 'fav',
+                'archive': 'archive'
+            };
+            
+            // Store full asset data for undo (so we can restore the UI)
+            lastAction = { 
+                asset: currentAsset,
+                action: action 
+            };
             
             const actionLabel = ACTION_LABELS[action] || action;
             
@@ -659,19 +788,28 @@ async def root():
                 return;
             }
             
-            const { id, action } = lastAction;
+            const { asset, action } = lastAction;
             showStatus(`undoing ${action}...`, 'info');
             
             try {
-                const r = await fetch(`/undo/${id}?action=${action}`, { method: 'POST' });
+                const r = await fetch(`/undo/${asset.id}?action=${action}`, { method: 'POST' });
                 const data = await r.json();
                 
                 if (data.error) {
                     showStatus(`undo failed: ${data.error}`, 'error');
                     addHistoryEntry(`undo ${ACTION_LABELS[action] || action} failed`, 'error');
                 } else {
-                    showStatus(`undone`, 'success');
-                    addHistoryEntry(`undo ${ACTION_LABELS[action] || action}`, 'success');
+                    // Put current image back into queue front
+                    if (currentAsset) {
+                        imageQueue.unshift(currentAsset);
+                    }
+                    
+                    // Restore the undone asset to the UI
+                    currentId = asset.id;
+                    currentAsset = asset;
+                    displayImage(asset);
+                    
+                    showStatus(`undone - vote again`, 'success');
                     lastAction = null;
                 }
             } catch (error) {
@@ -694,21 +832,47 @@ async def root():
             if (e.key === 'ArrowDown') sendAction('archive');
         });
         
-        // Load first image and start preloading queue
-        renderHistory();
+        // Initialize: load first image immediately, cameras in background
+        document.getElementById('cameraSelect').addEventListener('change', onCameraFilterChange);
+        
+        // Load first image immediately (don't wait for cameras)
         loadNext();
-        preloadQueue();
+        
+        // Load cameras in background (non-blocking)
+        setTimeout(() => loadCameras(), 100);
     </script>
 </body>
 </html>
     """
 
-@app.get("/next")
-async def next_image(count: int = 1):
-    """Get next image(s) - supports batch loading for queue"""
+@app.get("/cameras")
+async def get_cameras():
+    """Get list of available camera models"""
     try:
-        logger.info(f"Fetching {count} asset(s) from Immich")
-        assets = await immich.get_unreviewed(limit=count)
+        logger.info("Fetching camera models")
+        cameras = await immich.get_camera_models()
+        logger.info(f"Found {len(cameras)} unique camera models")
+        return {"cameras": cameras}
+    except Exception as e:
+        logger.error(f"Error fetching cameras: {e}", exc_info=True)
+        return {"error": str(e), "cameras": []}
+
+@app.get("/next")
+async def next_image(count: int = 1, cameras: str = None):
+    """Get next image(s) - supports batch loading for queue and camera filtering"""
+    try:
+        camera_list = None
+        if cameras:
+            camera_list = [c.strip() for c in cameras.split(",") if c.strip()]
+            logger.info(f"Fetching {count} asset(s) filtered by cameras: {camera_list}")
+        else:
+            logger.info(f"Fetching {count} asset(s) from Immich")
+        
+        if camera_list:
+            assets = await immich.get_unreviewed_filtered(limit=count, camera_models=camera_list)
+        else:
+            assets = await immich.get_unreviewed(limit=count)
+        
         if not assets or len(assets) == 0:
             logger.info("No more assets available")
             return {"done": True}
@@ -757,32 +921,26 @@ async def next_image(count: int = 1):
 @app.get("/proxy/{asset_id}/{size}")
 async def proxy_image(asset_id: str, size: str):
     """Proxy images/videos through backend to add API key authentication"""
-    import httpx
     logger.debug(f"Proxying {size} for asset {asset_id}")
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{immich.base}/assets/{asset_id}/{size}",
-                headers=immich.headers,
-                timeout=30.0,
-            )
-            r.raise_for_status()
-            from fastapi.responses import Response
-            
-            # Determine content type from response headers or size parameter
-            content_type = r.headers.get("content-type", "image/jpeg")
-            content_length = len(r.content)
-            if size == "original":
-                # For original, check if it might be a video
-                # Immich typically serves videos with video/* content type
-                if "video" in content_type.lower():
-                    content_type = content_type
-                elif not content_type.startswith("image/"):
-                    # Fallback: check file extension or assume video for large files
-                    content_type = "video/mp4"  # Common video format
-            
-            logger.debug(f"Serving {size} for {asset_id}: {content_type}, {content_length} bytes")
-            return Response(content=r.content, media_type=content_type)
+        # Use retry logic for proxy requests too
+        r = await immich.get_with_retry(f"{immich.base}/assets/{asset_id}/{size}", max_retries=1)
+        from fastapi.responses import Response
+        
+        # Determine content type from response headers or size parameter
+        content_type = r.headers.get("content-type", "image/jpeg")
+        content_length = len(r.content)
+        if size == "original":
+            # For original, check if it might be a video
+            # Immich typically serves videos with video/* content type
+            if "video" in content_type.lower():
+                content_type = content_type
+            elif not content_type.startswith("image/"):
+                # Fallback: check file extension or assume video for large files
+                content_type = "video/mp4"  # Common video format
+        
+        logger.debug(f"Serving {size} for {asset_id}: {content_type}, {content_length} bytes")
+        return Response(content=r.content, media_type=content_type)
     except Exception as e:
         logger.error(f"Error proxying {size} for {asset_id}: {e}", exc_info=True)
         raise

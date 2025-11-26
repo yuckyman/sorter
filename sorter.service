@@ -5,10 +5,20 @@ After=network.target
 [Service]
 Type=simple
 User=ian
+Group=ian
 WorkingDirectory=/home/ian/scripts/sorter
+Environment="PATH=/home/ian/scripts/sorter/venv/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=/home/ian/scripts/sorter/venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8050
 Restart=always
 RestartSec=5
+StartLimitInterval=300
+StartLimitBurst=5
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sorter
 
 [Install]
 WantedBy=multi-user.target

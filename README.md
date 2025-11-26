@@ -8,6 +8,7 @@ minimal photo/video review tool for immich.
 - **progressive loading** — thumbnail first, full res in background
 - **video support** — inline playback with duration badge
 - **metadata sidebar** — date, size, dims, camera, lens, exif data, location
+- **camera filter** — multi-select dropdown to filter by camera model
 - **logging** — track all actions and api calls
 - **ascii-minimal ui** — jade green monochrome terminal aesthetic
 
@@ -29,10 +30,10 @@ IMMICH_API_KEY=your-api-key-here
 
 run:
 ```bash
-uvicorn backend.main:app --reload --port 8000
+uvicorn backend.main:app --reload --port 8050
 ```
 
-open `http://localhost:8000`
+open `http://localhost:8050`
 
 ## controls
 
@@ -41,8 +42,18 @@ open `http://localhost:8000`
 [→]        skip     keep, move to next
 [↑]        fav      mark as favorite
 [↓]        archive  archive asset
-[ctrl+z]   undo     undo last action
+[ctrl+z]   undo     undo last action, restore image to UI
 ```
+
+**undo feature**: pressing `ctrl+z` reverses your last action (restores from trash, unfavorites, unarchives) and brings the previous image back to the screen so you can vote again.
+
+## camera filter
+
+use the camera dropdown in the header to filter assets by camera model:
+- select multiple cameras (hold ctrl/cmd while clicking)
+- select "all cameras" to clear filter
+- queue resets when filter changes
+- camera list loads lazily in background (non-blocking)
 
 ## logs
 
@@ -66,7 +77,7 @@ this will:
 - create venv and install deps
 - install and start systemd service
 
-access from any tailscale device: `http://yuckbox:8000`
+access from any tailscale device: `http://yuckbox:8050`
 
 manual service control:
 ```bash
@@ -75,10 +86,19 @@ sudo systemctl restart sorter
 sudo journalctl -u sorter -f
 ```
 
+## technical notes
+
+- **connection pooling**: persistent HTTP client with connection reuse for efficiency
+- **retry logic**: automatic retries with exponential backoff on timeouts
+- **sequential requests**: processes requests one at a time to avoid overwhelming server
+- **graceful degradation**: handles server errors and timeouts gracefully
+- **auto-restart**: systemd service configured with proper restart limits and graceful shutdown
+
 ## ideas
 
-- [x] undo last action
+- [x] undo last action (with UI restoration)
+- [x] camera filter
 - [ ] stats counter (deleted/kept/fav'd)
-- [ ] filter by date range or camera
+- [ ] filter by date range
 - [ ] batch mode (grid selection)
 - [ ] theme toggle

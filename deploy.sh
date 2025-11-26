@@ -62,6 +62,6 @@ echo "==> Done! Service status:"
 sudo systemctl status sorter --no-pager -l
 
 echo ""
-echo "Access at: http://yuckbox:8000"
+echo "Access at: http://yuckbox:8050"
 EOF
 
