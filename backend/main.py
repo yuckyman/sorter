@@ -23,7 +23,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_dir / f"app_{datetime.now().strftime('%Y%m%d')}.log"),
+        logging.FileHandler(log_dir / f"app_{datetime.now().strftime("%Y%m%d")}.log"),
         logging.StreamHandler()
     ]
 )
@@ -53,7 +53,7 @@ logger.info(f"Connected to Immich at {immich.base}")
 @app.on_event("startup")
 async def startup_event():
     logger.info("FastAPI application started")
-    logger.info(f"Log file: {log_dir / f'app_{datetime.now().strftime('%Y%m%d')}.log'}")
+    logger.info(f"Log file: {log_dir / f'app_{datetime.now().strftime("%Y%m%d")}.log'}")
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -220,13 +220,68 @@ async def root():
             color: var(--text-dim);
             font-size: 11px;
         }
+        
+        .header-controls {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        
+        .camera-filter {
+            position: relative;
+        }
+        
+        .camera-filter label {
+            color: var(--text-dim);
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-right: 8px;
+        }
+        
+        .camera-filter select {
+            background: var(--bg-light);
+            border: 1px solid var(--border);
+            color: var(--text);
+            font-family: inherit;
+            font-size: 11px;
+            padding: 4px 8px;
+            min-width: 200px;
+            max-width: 300px;
+            cursor: pointer;
+            max-height: 120px;
+        }
+        
+        .camera-filter select:focus {
+            outline: none;
+            border-color: var(--jade);
+        }
+        
+        .camera-filter select option {
+            background: var(--bg-light);
+            color: var(--text);
+            padding: 4px;
+        }
+        
+        .camera-filter select option:checked {
+            background: var(--jade-muted);
+            color: var(--jade-bright);
+        }
     </style>
 </head>
 <body>
     <div class="wrap">
         <div class="header">
             <div class="title">sorter <span>// immich</span></div>
-            <div class="queue-ct" id="queueInfo">queue: 0</div>
+            <div class="header-controls">
+                <div class="camera-filter">
+                    <label for="cameraSelect">camera:</label>
+                    <select id="cameraSelect" multiple size="4" title="hold ctrl/cmd to select multiple">
+                        <option value="">loading...</option>
+                    </select>
+                </div>
+                <div class="queue-ct" id="queueInfo">queue: 0</div>
+            </div>
         </div>
         
         <div class="main">
@@ -268,6 +323,7 @@ async def root():
         let imageQueue = []; // Queue of preloaded images
         const QUEUE_SIZE = 3; // Preload 3 images ahead
         let isPreloading = false;
+        let selectedCameras = []; // Selected camera models for filtering
         
         function showStatus(message, type = 'info') {
             const status = document.getElementById('status');
@@ -372,13 +428,59 @@ async def root():
             }
         }
         
+        // Load available camera models
+        async function loadCameras() {
+            try {
+                const r = await fetch('/cameras');
+                const data = await r.json();
+                
+                if (data.error) {
+                    console.error('Error loading cameras:', data.error);
+                    return;
+                }
+                
+                const select = document.getElementById('cameraSelect');
+                select.innerHTML = '<option value="">all cameras</option>';
+                
+                if (data.cameras && data.cameras.length > 0) {
+                    data.cameras.forEach(camera => {
+                        const option = document.createElement('option');
+                        option.value = camera;
+                        option.textContent = camera;
+                        select.appendChild(option);
+                    });
+                } else {
+                    select.innerHTML = '<option value="">no cameras found</option>';
+                }
+            } catch (error) {
+                console.error('Error loading cameras:', error);
+            }
+        }
+        
+        // Handle camera filter change
+        function onCameraFilterChange() {
+            const select = document.getElementById('cameraSelect');
+            selectedCameras = Array.from(select.selectedOptions)
+                .map(opt => opt.value)
+                .filter(v => v); // Remove empty values
+            
+            // Clear queue and reload when filter changes
+            imageQueue = [];
+            currentId = null;
+            loadNext();
+        }
+        
         // Preload next batch of images into queue
         async function preloadQueue() {
             if (isPreloading || imageQueue.length >= QUEUE_SIZE) return;
             
             isPreloading = true;
             try {
-                const r = await fetch(`/next?count=${QUEUE_SIZE}`);
+                let url = `/next?count=${QUEUE_SIZE}`;
+                if (selectedCameras.length > 0) {
+                    url += `&cameras=${encodeURIComponent(selectedCameras.join(','))}`;
+                }
+                const r = await fetch(url);
                 const data = await r.json();
                 
                 if (data.error) {
@@ -437,7 +539,11 @@ async def root():
             setLoading(true);
             
             try {
-                const r = await fetch('/next');
+                let url = '/next';
+                if (selectedCameras.length > 0) {
+                    url += `?cameras=${encodeURIComponent(selectedCameras.join(','))}`;
+                }
+                const r = await fetch(url);
                 const data = await r.json();
                 
                 if (data.error) {
@@ -534,6 +640,10 @@ async def root():
             if (e.key === 'ArrowDown') sendAction('archive');
         });
         
+        // Initialize: load cameras and first image
+        loadCameras();
+        document.getElementById('cameraSelect').addEventListener('change', onCameraFilterChange);
+        
         // Load first image and start preloading queue
         loadNext();
         preloadQueue();
@@ -542,12 +652,34 @@ async def root():
 </html>
     """
 
-@app.get("/next")
-async def next_image(count: int = 1):
-    """Get next image(s) - supports batch loading for queue"""
+@app.get("/cameras")
+async def get_cameras():
+    """Get list of available camera models"""
     try:
-        logger.info(f"Fetching {count} asset(s) from Immich")
-        assets = await immich.get_unreviewed(limit=count)
+        logger.info("Fetching camera models")
+        cameras = await immich.get_camera_models()
+        logger.info(f"Found {len(cameras)} unique camera models")
+        return {"cameras": cameras}
+    except Exception as e:
+        logger.error(f"Error fetching cameras: {e}", exc_info=True)
+        return {"error": str(e), "cameras": []}
+
+@app.get("/next")
+async def next_image(count: int = 1, cameras: str = None):
+    """Get next image(s) - supports batch loading for queue and camera filtering"""
+    try:
+        camera_list = None
+        if cameras:
+            camera_list = [c.strip() for c in cameras.split(",") if c.strip()]
+            logger.info(f"Fetching {count} asset(s) filtered by cameras: {camera_list}")
+        else:
+            logger.info(f"Fetching {count} asset(s) from Immich")
+        
+        if camera_list:
+            assets = await immich.get_unreviewed_filtered(limit=count, camera_models=camera_list)
+        else:
+            assets = await immich.get_unreviewed(limit=count)
+        
         if not assets or len(assets) == 0:
             logger.info("No more assets available")
             return {"done": True}

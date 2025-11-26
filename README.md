@@ -8,6 +8,7 @@ minimal photo/video review tool for immich.
 - **progressive loading** — thumbnail first, full res in background
 - **video support** — inline playback with duration badge
 - **metadata sidebar** — date, size, dims, camera, lens, exif data, location
+- **camera filter** — multi-select dropdown to filter by camera model
 - **logging** — track all actions and api calls
 - **ascii-minimal ui** — jade green monochrome terminal aesthetic
 
@@ -29,10 +30,10 @@ IMMICH_API_KEY=your-api-key-here
 
 run:
 ```bash
-uvicorn backend.main:app --reload --port 8000
+uvicorn backend.main:app --reload --port 8050
 ```
 
-open `http://localhost:8000`
+open `http://localhost:8050`
 
 ## controls
 
@@ -43,6 +44,13 @@ open `http://localhost:8000`
 [↓]        archive  archive asset
 [ctrl+z]   undo     undo last action
 ```
+
+## camera filter
+
+use the camera dropdown in the header to filter assets by camera model:
+- select multiple cameras (hold ctrl/cmd while clicking)
+- select "all cameras" to clear filter
+- queue resets when filter changes
 
 ## logs
 
@@ -66,7 +74,7 @@ this will:
 - create venv and install deps
 - install and start systemd service
 
-access from any tailscale device: `http://yuckbox:8000`
+access from any tailscale device: `http://yuckbox:8050`
 
 manual service control:
 ```bash
