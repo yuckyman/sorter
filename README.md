@@ -42,8 +42,10 @@ open `http://localhost:8050`
 [→]        skip     keep, move to next
 [↑]        fav      mark as favorite
 [↓]        archive  archive asset
-[ctrl+z]   undo     undo last action
+[ctrl+z]   undo     undo last action, restore image to UI
 ```
+
+**undo feature**: pressing `ctrl+z` reverses your last action (restores from trash, unfavorites, unarchives) and brings the previous image back to the screen so you can vote again.
 
 ## camera filter
 
@@ -51,6 +53,7 @@ use the camera dropdown in the header to filter assets by camera model:
 - select multiple cameras (hold ctrl/cmd while clicking)
 - select "all cameras" to clear filter
 - queue resets when filter changes
+- camera list loads lazily in background (non-blocking)
 
 ## logs
 
@@ -83,10 +86,19 @@ sudo systemctl restart sorter
 sudo journalctl -u sorter -f
 ```
 
+## technical notes
+
+- **connection pooling**: persistent HTTP client with connection reuse for efficiency
+- **retry logic**: automatic retries with exponential backoff on timeouts
+- **sequential requests**: processes requests one at a time to avoid overwhelming server
+- **graceful degradation**: handles server errors and timeouts gracefully
+- **auto-restart**: systemd service configured with proper restart limits and graceful shutdown
+
 ## ideas
 
-- [x] undo last action
+- [x] undo last action (with UI restoration)
+- [x] camera filter
 - [ ] stats counter (deleted/kept/fav'd)
-- [ ] filter by date range or camera
+- [ ] filter by date range
 - [ ] batch mode (grid selection)
 - [ ] theme toggle
