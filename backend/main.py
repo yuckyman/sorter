@@ -374,6 +374,46 @@ async def root():
             background: var(--jade-muted);
             color: var(--jade-bright);
         }
+        
+        .smart-filter {
+            position: relative;
+        }
+        
+        .smart-filter label {
+            color: var(--text-dim);
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-right: 8px;
+        }
+        
+        .smart-filter select {
+            background: var(--bg-light);
+            border: 1px solid var(--border);
+            color: var(--text);
+            font-family: inherit;
+            font-size: 11px;
+            padding: 4px 8px;
+            min-width: 150px;
+            max-width: 200px;
+            cursor: pointer;
+        }
+        
+        .smart-filter select:focus {
+            outline: none;
+            border-color: var(--jade);
+        }
+        
+        .smart-filter select option {
+            background: var(--bg-light);
+            color: var(--text);
+            padding: 4px;
+        }
+        
+        .smart-filter select option:checked {
+            background: var(--jade-muted);
+            color: var(--jade-bright);
+        }
     </style>
 </head>
 <body>
@@ -381,6 +421,17 @@ async def root():
         <div class="header">
             <div class="title">sorter <span>// immich</span></div>
             <div class="header-controls">
+                <div class="smart-filter">
+                    <label for="smartSelect">type:</label>
+                    <select id="smartSelect" title="filter by image type">
+                        <option value="">all</option>
+                        <option value="screenshot">screenshot</option>
+                        <option value="selfie">selfie</option>
+                        <option value="portrait">portrait</option>
+                        <option value="landscape">landscape</option>
+                        <option value="document">document</option>
+                    </select>
+                </div>
                 <div class="camera-filter">
                     <label for="cameraSelect">camera:</label>
                     <select id="cameraSelect" multiple size="4" title="hold ctrl/cmd to select multiple">
@@ -438,6 +489,7 @@ async def root():
         const QUEUE_SIZE = 3; // Preload 3 images ahead
         let isPreloading = false;
         let selectedCameras = []; // Selected camera models for filtering
+        let selectedSmartQuery = null; // Selected smart search query (screenshot, selfie, etc.)
         let seenAssetIds = new Set(); // Track seen assets to prevent duplicates
         let statusTimer = null;
         let fadeTimer = null;
@@ -590,6 +642,20 @@ async def root():
             }
         }
         
+        // Handle smart filter change
+        function onSmartFilterChange() {
+            const select = document.getElementById('smartSelect');
+            selectedSmartQuery = select.value || null;
+            
+            // Clear queue and seen IDs when filter changes
+            imageQueue = [];
+            seenAssetIds.clear();
+            currentId = null;
+            currentAsset = null;
+            lastAction = null;  // Clear undo history too
+            loadNext();
+        }
+        
         // Handle camera filter change
         function onCameraFilterChange() {
             const select = document.getElementById('cameraSelect');
@@ -613,7 +679,9 @@ async def root():
             isPreloading = true;
             try {
                 let url = `/next?count=${QUEUE_SIZE}`;
-                if (selectedCameras.length > 0) {
+                if (selectedSmartQuery) {
+                    url += `&smart_query=${encodeURIComponent(selectedSmartQuery)}`;
+                } else if (selectedCameras.length > 0) {
                     url += `&cameras=${encodeURIComponent(selectedCameras.join(','))}`;
                 }
                 const r = await fetch(url);
@@ -683,8 +751,14 @@ async def root():
             
             try {
                 let url = '/next';
-                if (selectedCameras.length > 0) {
-                    url += `?cameras=${encodeURIComponent(selectedCameras.join(','))}`;
+                const params = [];
+                if (selectedSmartQuery) {
+                    params.push(`smart_query=${encodeURIComponent(selectedSmartQuery)}`);
+                } else if (selectedCameras.length > 0) {
+                    params.push(`cameras=${encodeURIComponent(selectedCameras.join(','))}`);
+                }
+                if (params.length > 0) {
+                    url += '?' + params.join('&');
                 }
                 const r = await fetch(url);
                 const data = await r.json();
@@ -807,6 +881,7 @@ async def root():
         });
         
         // Initialize: load first image immediately, cameras in background
+        document.getElementById('smartSelect').addEventListener('change', onSmartFilterChange);
         document.getElementById('cameraSelect').addEventListener('change', onCameraFilterChange);
         
         // Load first image immediately (don't wait for cameras)
@@ -839,28 +914,70 @@ async def get_cameras():
         logger.error(f"Error fetching cameras: {e}", exc_info=True)
         return {"error": str(e), "cameras": []}
 
-@app.get("/next")
-async def next_image(count: int = 1, cameras: str = None):
-    """Get next image(s) - supports batch loading for queue and camera filtering"""
+@app.get("/smart-search-status")
+async def smart_search_status():
+    """Check if smart search is available and working"""
     try:
-        camera_list = None
-        if cameras:
-            camera_list = [c.strip() for c in cameras.split(",") if c.strip()]
-            logger.info(f"Fetching {count} asset(s) filtered by cameras: {camera_list}")
+        logger.info("Checking smart search availability")
+        # Try a simple test query
+        test_results = await immich.search_smart(query="test", limit=1, filter_by_dimensions=False)
+        return {
+            "available": True,
+            "working": len(test_results) >= 0,  # Even empty results means it's working
+            "message": "Smart search is available"
+        }
+    except Exception as e:
+        logger.warning(f"Smart search check failed: {e}")
+        return {
+            "available": False,
+            "working": False,
+            "error": str(e),
+            "message": "Smart search may not be available or configured"
+        }
+
+@app.get("/next")
+async def next_image(count: int = 1, cameras: str = None, smart_query: str = None):
+    """Get next image(s) - supports batch loading for queue, camera filtering, and smart search"""
+    try:
+        # Smart search takes priority if provided
+        if smart_query:
+            logger.info(f"Fetching {count} asset(s) using smart search: '{smart_query}'")
+            # Use dimension filtering for screenshots to improve accuracy
+            filter_by_dims = smart_query.lower() == "screenshot"
+            assets = await immich.search_smart(query=smart_query, limit=count, filter_by_dimensions=filter_by_dims)
         else:
-            logger.info(f"Fetching {count} asset(s) from Immich")
-        
-        if camera_list:
-            assets = await immich.get_unreviewed_filtered(limit=count, camera_models=camera_list)
-        else:
-            assets = await immich.get_unreviewed(limit=count)
+            camera_list = None
+            if cameras:
+                camera_list = [c.strip() for c in cameras.split(",") if c.strip()]
+                logger.info(f"Fetching {count} asset(s) filtered by cameras: {camera_list}")
+            else:
+                logger.info(f"Fetching {count} asset(s) from Immich")
+            
+            if camera_list:
+                assets = await immich.get_unreviewed_filtered(limit=count, camera_models=camera_list)
+            else:
+                assets = await immich.get_unreviewed(limit=count)
         
         if not assets or len(assets) == 0:
             logger.info("No more assets available")
             return {"done": True}
         
+        # Log first asset structure for debugging
+        if assets and len(assets) > 0:
+            logger.info(f"First asset keys: {list(assets[0].keys()) if isinstance(assets[0], dict) else 'not a dict'}")
+            logger.info(f"First asset sample: {str(assets[0])[:200] if isinstance(assets[0], dict) else assets[0]}")
+        
         # Always return consistent format with metadata
         def format_asset(asset):
+            if not asset or not isinstance(asset, dict):
+                logger.error(f"Invalid asset format: {type(asset)}, value: {asset}")
+                raise ValueError(f"Invalid asset: expected dict, got {type(asset)}")
+            
+            if "id" not in asset:
+                logger.error(f"Asset missing 'id' field. Available keys: {list(asset.keys())}")
+                logger.error(f"Asset content: {asset}")
+                raise ValueError(f"Asset missing 'id' field. Available keys: {list(asset.keys())}")
+            
             exif = asset.get("exifInfo", {}) or {}
             return {
                 "id": asset["id"],

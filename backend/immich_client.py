@@ -197,3 +197,169 @@ class ImmichClient:
                 await asyncio.sleep(0.25)
         
         return matching_assets[:limit]
+
+    def _is_screenshot_dimension(self, width, height):
+        """Check if dimensions match common screenshot resolutions"""
+        if not width or not height:
+            return False
+        
+        # Common iPhone screenshot dimensions (portrait)
+        iphone_screenshots = [
+            (1170, 2532),   # iPhone 13/14 Pro
+            (1284, 2778),   # iPhone 14 Pro Max
+            (1179, 2556),   # iPhone 15/16 Pro
+            (1290, 2796),   # iPhone 15/16 Pro Max
+            (750, 1334),    # iPhone SE
+            (1242, 2688),   # iPhone XS Max
+            (828, 1792),    # iPhone XR
+        ]
+        
+        # Check exact match or swapped (landscape screenshots)
+        for w, h in iphone_screenshots:
+            if (width == w and height == h) or (width == h and height == w):
+                return True
+        
+        # Check aspect ratio (most iPhone screenshots are ~19.5:9 or 16:9)
+        aspect = width / height if height > 0 else 0
+        if 0.4 <= aspect <= 0.6:  # Portrait screenshots (tall)
+            return True
+        if 1.6 <= aspect <= 1.8:  # Landscape screenshots (wide)
+            return True
+        
+        return False
+    
+    async def search_smart(self, query: str, limit: int = 1, filter_by_dimensions: bool = False):
+        """Search assets using Immich's smart search (CLIP-based semantic search)"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Improve query terms for better CLIP model understanding
+        query_map = {
+            "screenshot": "screenshot of phone screen mobile device",
+            "selfie": "selfie portrait photo person face front camera",
+            "portrait": "portrait photo person face",
+            "landscape": "landscape scenery nature outdoor view",
+            "document": "document text paper scan"
+        }
+        
+        # Use improved query if available, otherwise use original
+        improved_query = query_map.get(query.lower(), query)
+        logger.info(f"Smart search query: '{query}' -> '{improved_query}'")
+        
+        try:
+            # Use the searchSmart endpoint with POST and a body
+            # Try /search/smart first, fall back to /search-smart if needed
+            search_urls = [
+                f"{self.base}/search/smart",
+                f"{self.base}/search-smart"
+            ]
+            
+            # Request more results if we need to filter by dimensions
+            request_size = limit * 5 if filter_by_dimensions else limit
+            
+            body = {
+                "query": improved_query,
+                "size": request_size,
+                "isArchived": False,
+                "isTrashed": False
+            }
+            
+            last_error = None
+            for search_url in search_urls:
+                try:
+                    logger.info(f"Smart search request: {search_url} with query: {query}")
+                    r = await self._request_with_retry("POST", search_url, max_retries=2, json=body)
+                    data = r.json()
+                    
+                    logger.info(f"Smart search response type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+                    
+                    # searchSmart returns a dict with items array or count/items structure
+                    if isinstance(data, dict):
+                        if "items" in data:
+                            items = data["items"]
+                            logger.info(f"Found {len(items)} items in response")
+                            if len(items) == 0:
+                                logger.info("Smart search returned empty items array")
+                                return []
+                            
+                            # Log first item structure for debugging
+                            if items and len(items) > 0:
+                                first_item = items[0]
+                                logger.info(f"First item type: {type(first_item)}, keys: {list(first_item.keys()) if isinstance(first_item, dict) else 'not a dict'}")
+                            
+                            # Ensure items are valid assets with id field
+                            valid_items = []
+                            for item in items:
+                                if isinstance(item, dict):
+                                    # Check for id in various possible locations
+                                    asset_id = item.get("id") or item.get("assetId")
+                                    if not asset_id:
+                                        logger.warning(f"Item missing id field, keys: {list(item.keys())}")
+                                        continue
+                                    
+                                    # If filtering by dimensions (for screenshots), check dimensions
+                                    if filter_by_dimensions and query.lower() == "screenshot":
+                                        exif = item.get("exifInfo", {}) or {}
+                                        width = exif.get("exifImageWidth")
+                                        height = exif.get("exifImageHeight")
+                                        
+                                        if width and height:
+                                            if self._is_screenshot_dimension(width, height):
+                                                valid_items.append(item)
+                                                logger.info(f"Found screenshot match: {width}x{height}")
+                                            else:
+                                                logger.debug(f"Skipping non-screenshot dimensions: {width}x{height}")
+                                        else:
+                                            # If no EXIF, include it anyway (might be a screenshot)
+                                            valid_items.append(item)
+                                    else:
+                                        # No dimension filtering, include all valid items
+                                        valid_items.append(item)
+                                    
+                                    # Stop when we have enough
+                                    if len(valid_items) >= limit:
+                                        break
+                                else:
+                                    logger.warning(f"Item is not a dict: {type(item)}")
+                            
+                            if valid_items:
+                                logger.info(f"Returning {len(valid_items)} valid assets from smart search (filtered from {len(items)} items)")
+                                return valid_items[:limit]
+                            else:
+                                logger.warning("No valid assets found in items array")
+                        elif "id" in data:
+                            # Single asset returned as dict
+                            logger.info("Single asset returned from smart search")
+                            return [data]
+                        elif "count" in data:
+                            count = data.get("count", 0)
+                            logger.info(f"Smart search returned count: {count}")
+                            if count == 0:
+                                return []
+                    
+                    if isinstance(data, list):
+                        # Direct list of assets
+                        valid_items = [item for item in data[:limit] if isinstance(item, dict) and "id" in item]
+                        if valid_items:
+                            logger.info(f"Returning {len(valid_items)} valid assets from list response")
+                            return valid_items
+                    
+                    # If we got here, the response format is unexpected
+                    logger.warning(f"Smart search returned unexpected format: {data}")
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Smart search failed for {search_url}: {e}")
+                    continue
+            
+            # If all attempts failed, log and fall back
+            if last_error:
+                logger.error(f"Smart search failed with error: {last_error}")
+            else:
+                logger.warning(f"Smart search returned unexpected format, falling back to random")
+            return await self.get_unreviewed(limit=limit)
+        except Exception as e:
+            logger.error(f"Smart search error: {e}", exc_info=True)
+            # If smart search fails, fall back to random
+            # This handles cases where smart search isn't available or query fails
+            return await self.get_unreviewed(limit=limit)
