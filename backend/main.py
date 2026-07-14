@@ -1532,7 +1532,7 @@ async def reset_seen_assets():
     return {"ok": True}
 
 @app.post("/action/{asset_id}")
-async def action(asset_id: str, action: ActionLiteral) -> ActionResponse:
+async def action(asset_id: str, action: ActionLiteral):
     logger.info(f"Action '{action}' on asset {asset_id}")
     try:
         updated_stats = None
@@ -1560,7 +1560,7 @@ async def action(asset_id: str, action: ActionLiteral) -> ActionResponse:
         return {"error": str(e), "type": type(e).__name__}
 
 @app.post("/undo/{asset_id}")
-async def undo_action(asset_id: str, action: ActionLiteral) -> ActionResponse:
+async def undo_action(asset_id: str, action: ActionLiteral):
     logger.info(f"Undo '{action}' on asset {asset_id}")
     try:
         updated_stats = None
