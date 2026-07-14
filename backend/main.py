@@ -1,29 +1,45 @@
-from fastapi import FastAPI
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 import sys
 import os
-import json
 import asyncio
 import logging
+import random
 from pathlib import Path
 from datetime import datetime
+from typing import Any
+
 from dotenv import load_dotenv
 
-# Load environment variables from .env.local
+from models import (
+    ActionLiteral,
+    ActionResponse,
+    AssetFormatted,
+    AssetInput,
+    ExifInfo,
+    StatsResponse,
+    StatsState,
+    default_action_counts,
+    default_stats_state,
+)
+
 env_path = Path(__file__).parent.parent / ".env.local"
 load_dotenv(env_path)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from immich_client import ImmichClient
+from state_store import StateStore
 
-# Setup logging
 log_dir = Path(__file__).parent.parent / "logs"
 log_dir.mkdir(exist_ok=True)
 log_file = log_dir / f"app_{datetime.now().strftime('%Y%m%d')}.log"
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(log_file),
@@ -31,8 +47,8 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-# Load config from environment
 IMMICH_URL = os.getenv("IMMICH_URL")
 IMMICH_API_KEY = os.getenv("IMMICH_API_KEY")
 
@@ -40,7 +56,21 @@ if not IMMICH_URL or not IMMICH_API_KEY:
     logger.error("Missing IMMICH_URL or IMMICH_API_KEY in .env.local")
     raise ValueError("Set IMMICH_URL and IMMICH_API_KEY in .env.local")
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app):
+    logger.info("FastAPI application started")
+    logger.info(f"Log file: {log_file}")
+    async with stats_lock:
+        state = _load_stats_no_lock()
+        state["session"]["id"] = state["session"]["id"] + 1
+        state["session"]["counts"] = default_action_counts()
+        _write_stats_no_lock(state)
+    logger.info(f"Session {state['session']['id']} started")
+    yield
+    logger.info("Shutting down, closing connections...")
+    await immich.close()
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,118 +83,71 @@ logger.info("Starting Immich Photo Sorter application")
 immich = ImmichClient(IMMICH_URL, IMMICH_API_KEY)
 logger.info(f"Connected to Immich at {immich.base}")
 
-stats_file = Path(__file__).parent.parent / "stats.json"
+db_file = Path(__file__).parent.parent / "sorter.db"
+state_store = StateStore(db_file)
 stats_lock = asyncio.Lock()
+feed_lock = asyncio.Lock()
+COOLDOWN_DAYS = int(os.getenv("SORTER_SEEN_COOLDOWN_DAYS", "30"))
 
-def _default_counts():
-    return {"delete": 0, "keep": 0, "fav": 0, "archive": 0}
-
-def _default_day_counts():
-    return {"delete": 0, "keep": 0, "fav": 0, "archive": 0}
-
-def _default_state():
-    return {
-        "lifetime": _default_counts(),
-        "session": {"id": 0, "counts": _default_counts()},
-        "daily": {}
-    }
-
-def _normalize_state(data):
+def _normalize_state(data: Any) -> StatsState:
     if not isinstance(data, dict):
-        return _default_state()
+        return default_stats_state()
 
-    # Backward compatibility: old flat stats dict
-    if "lifetime" not in data and "session" not in data and "daily" not in data:
-        state = _default_state()
-        for key in state["lifetime"]:
-            if key in data:
-                try:
-                    state["lifetime"][key] = max(0, int(data[key]))
-                except (TypeError, ValueError):
-                    pass
-        return state
-
-    state = _default_state()
+    state = default_stats_state()
     lifetime = data.get("lifetime", {})
     session = data.get("session", {})
     daily = data.get("daily", {})
 
     for key in state["lifetime"]:
         if key in lifetime:
-            try:
-                state["lifetime"][key] = max(0, int(lifetime[key]))
-            except (TypeError, ValueError):
-                pass
+            state["lifetime"][key] = max(0, int(lifetime[key]))
 
     session_id = session.get("id", state["session"]["id"])
-    try:
-        state["session"]["id"] = max(0, int(session_id))
-    except (TypeError, ValueError):
-        pass
+    state["session"]["id"] = max(0, int(session_id))
 
     session_counts = session.get("counts", {})
     for key in state["session"]["counts"]:
         if key in session_counts:
-            try:
-                state["session"]["counts"][key] = max(0, int(session_counts[key]))
-            except (TypeError, ValueError):
-                pass
+            state["session"]["counts"][key] = max(0, int(session_counts[key]))
 
     if isinstance(daily, dict):
         for day_key, day_val in daily.items():
             if not isinstance(day_key, str):
                 continue
             if isinstance(day_val, dict):
-                day_counts = _default_day_counts()
+                day_counts = default_action_counts()
                 for key in day_counts:
                     if key in day_val:
-                        try:
-                            day_counts[key] = max(0, int(day_val[key]))
-                        except (TypeError, ValueError):
-                            pass
+                        day_counts[key] = max(0, int(day_val[key]))
                 state["daily"][day_key] = day_counts
-            else:
-                try:
-                    fallback_total = max(0, int(day_val))
-                    state["daily"][day_key] = {
-                        "keep": fallback_total,
-                        "delete": 0,
-                        "fav": 0,
-                        "archive": 0
-                    }
-                except (TypeError, ValueError):
-                    pass
 
     return state
 
-def _load_stats_no_lock():
-    if not stats_file.exists():
-        return _default_state()
+def _load_stats_no_lock() -> StatsState:
     try:
-        with stats_file.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        data = state_store.get_state_json("stats")
+        if data is None:
+            return default_stats_state()
         return _normalize_state(data)
     except Exception as e:
-        logger.warning(f"Failed to read stats file: {e}", exc_info=True)
-        return _default_state()
+        logger.warning(f"Failed to read stats from sqlite: {e}", exc_info=True)
+        return default_stats_state()
 
-def _write_stats_no_lock(state):
-    tmp_path = stats_file.with_suffix(".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, indent=2, sort_keys=True)
-    os.replace(tmp_path, stats_file)
+def _write_stats_no_lock(state: StatsState) -> None:
+    normalized = _normalize_state(state)
+    state_store.set_state_json("stats", normalized)
 
-async def read_stats():
+async def read_stats() -> StatsResponse:
     async with stats_lock:
         state = _load_stats_no_lock()
         return {
             "session_id": state["session"]["id"],
             "session": state["session"]["counts"],
             "lifetime": state["lifetime"],
-            "daily": state["daily"]
+            "daily": state["daily"],
         }
 
-async def update_stats(action, delta):
+async def update_stats(action: ActionLiteral, delta: int) -> StatsResponse:
     async with stats_lock:
         state = _load_stats_no_lock()
         if action in state["lifetime"]:
@@ -174,7 +157,7 @@ async def update_stats(action, delta):
         day_key = datetime.now().strftime("%Y-%m-%d")
         day_counts = state["daily"].get(day_key)
         if not isinstance(day_counts, dict):
-            day_counts = _default_day_counts()
+            day_counts = default_action_counts()
         if action in day_counts:
             day_counts[action] = max(0, day_counts[action] + delta)
         state["daily"][day_key] = day_counts
@@ -183,28 +166,12 @@ async def update_stats(action, delta):
             "session_id": state["session"]["id"],
             "session": state["session"]["counts"],
             "lifetime": state["lifetime"],
-            "daily": state["daily"]
+            "daily": state["daily"],
         }
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("FastAPI application started")
-    logger.info(f"Log file: {log_file}")
-    async with stats_lock:
-        state = _load_stats_no_lock()
-        state["session"]["id"] = state["session"]["id"] + 1
-        state["session"]["counts"] = _default_counts()
-        _write_stats_no_lock(state)
-    logger.info(f"Session {state['session']['id']} started")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Shutting down, closing connections...")
-    await immich.close()
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    """Serve the main app interface"""
     return """
 <!DOCTYPE html>
 <html lang="en">
@@ -232,7 +199,8 @@ async def root():
         body {
             font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
             background: var(--bg);
-            min-height: 100vh;
+            height: 100vh;
+            overflow: hidden;
             color: var(--text);
             font-size: 13px;
             line-height: 1.5;
@@ -242,6 +210,10 @@ async def root():
             max-width: 1200px;
             margin: 0 auto;
             padding: 20px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
         }
         
         .header {
@@ -251,6 +223,7 @@ async def root():
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-shrink: 0;
         }
         
         .title { color: var(--jade); }
@@ -261,16 +234,20 @@ async def root():
             grid-template-columns: 1fr 220px;
             gap: 20px;
             margin-bottom: 15px;
+            flex: 1;
+            min-height: 0;
         }
         
         .frame {
             position: relative;
             border: 1px solid var(--border);
-            min-height: 55vh;
+            height: 100%;
+            min-height: 0;
             display: flex;
             align-items: center;
             justify-content: center;
             background: var(--bg-light);
+            overflow: hidden;
         }
         
         .frame.loading::after {
@@ -405,7 +382,6 @@ async def root():
         }
         
         .history-entry.success { color: var(--jade); border-color: var(--jade-dim); }
-        .history-entry.error { color: #8a5a5a; border-color: #8a5a5a33; }
         
         .history-time { font-size: 10px; color: var(--text-dim); }
         .history-text { font-size: 11px; color: var(--text-bright); }
@@ -708,19 +684,24 @@ async def root():
     </div>
     
     <script>
+        const ACTION_NAMES = { 'delete': 'del', 'keep': 'skip', 'fav': 'fav', 'archive': 'archive' };
         let currentId = null;
-        let imageQueue = []; // Queue of preloaded images
-        const QUEUE_SIZE = 6; // Preload 6 images ahead
-        const PRELOAD_THRESHOLD = 3; // Start preloading when queue drops to this
-        const FULL_RES_PRELOAD_LIMIT = 2; // Only preload full-res for next few images
+        let imageQueue = [];
+        const TARGET_QUEUE_SIZE = 35;
+        const QUEUE_REFILL_BATCH = 5;
+        const QUEUE_REFILL_DELAY_MS = 1000;
+        const THUMB_PRELOAD_LIMIT = 20;
+        const QUEUE_REFILL_ERROR_DELAY_MS = 1800;
+        const FULL_RES_PRELOAD_LIMIT = 1;
         let isPreloading = false;
-        let selectedCameras = []; // Selected camera models for filtering
-        let selectedSmartQuery = null; // Selected smart search query (screenshot, selfie, etc.)
-        let seenAssetIds = new Set(); // Track seen assets to prevent duplicates
+        let preloadRetryTimer = null;
+        let selectedCameras = [];
+        let selectedSmartQuery = null;
+        let queuedAssetIds = new Set();
         let preloadedFullRes = new Set();
         let statusTimer = null;
         let fadeTimer = null;
-        let displayGeneration = 0; // track which image load is "current" to prevent race conditions
+        let displayGeneration = 0;
         let stats = {
             session_id: 0,
             session: { delete: 0, keep: 0, fav: 0, archive: 0 },
@@ -878,20 +859,25 @@ async def root():
             renderStats();
         }
 
+        function applyServerStats(serverStats) {
+            if (!serverStats) return;
+            stats = {
+                session_id: serverStats.session_id || stats.session_id || 0,
+                session: serverStats.session || stats.session,
+                lifetime: serverStats.lifetime || stats.lifetime,
+                daily: serverStats.daily || stats.daily
+            };
+            renderStats();
+        }
+
         async function fetchStats() {
             try {
                 const r = await fetch('/stats');
                 const data = await r.json();
                 if (!data || data.error) return;
-                stats = {
-                    session_id: data.session_id || stats.session_id || 0,
-                    session: data.session || stats.session,
-                    lifetime: data.lifetime || stats.lifetime,
-                    daily: data.daily || stats.daily
-                };
-                renderStats();
+                applyServerStats(data);
             } catch (error) {
-                console.warn('Failed to load stats:', error);
+                showStatus(`Failed to load stats: ${error.message}`, 'error');
             }
         }
         
@@ -907,7 +893,6 @@ async def root():
             }
         }
         
-        // Preload full resolution image in background
         function preloadFullImage(url) {
             return new Promise((resolve, reject) => {
                 const img = new Image();
@@ -917,7 +902,6 @@ async def root():
             });
         }
         
-        // Update metadata sidebar
         function updateMeta(asset) {
             const m = asset.meta || {};
             document.getElementById('metaDate').textContent = m.date || '--';
@@ -932,7 +916,6 @@ async def root():
             document.getElementById('metaFocal').textContent = m.focal || '--';
             document.getElementById('metaLocation').textContent = m.location || '--';
             
-            // Update type badge
             let typeText = asset.type || 'IMAGE';
             if (asset.type === 'VIDEO' && asset.duration) {
                 let dur = asset.duration;
@@ -948,31 +931,25 @@ async def root():
             }
             document.getElementById('typeBadge').textContent = typeText;
             
-            // Update queue counter
             document.getElementById('queueInfo').textContent = `queue: ${imageQueue.length}`;
         }
         
-        // Load image or video with progressive enhancement
         function displayImage(asset) {
             const photo = document.getElementById('photo');
             const video = document.getElementById('video');
             const frame = document.getElementById('frame');
             
-            // Increment generation to invalidate any in-flight image loads
             const thisGeneration = ++displayGeneration;
             
-            // Pause and reset video if playing
             if (video && !video.paused) {
                 video.pause();
                 video.currentTime = 0;
             }
             
-            // Hide both
             photo.style.display = 'none';
             video.style.display = 'none';
             frame.classList.remove('loading');
             
-            // Update metadata
             updateMeta(asset);
             
             if (asset.type === 'VIDEO') {
@@ -987,7 +964,6 @@ async def root():
                 
                 preloadFullImage(asset.image_url)
                     .then(() => {
-                        // only update if we're still showing this image (no race)
                         if (thisGeneration === displayGeneration) {
                             photo.src = asset.image_url;
                             photo.style.opacity = '1';
@@ -997,14 +973,13 @@ async def root():
             }
         }
         
-        // Load available camera models
         async function loadCameras() {
             try {
                 const r = await fetch('/cameras');
                 const data = await r.json();
                 
                 if (data.error) {
-                    console.error('Error loading cameras:', data.error);
+                    showStatus(`Error loading cameras: ${data.error}`, 'error');
                     return;
                 }
                 
@@ -1022,90 +997,95 @@ async def root():
                     select.innerHTML = '<option value="">no cameras found</option>';
                 }
             } catch (error) {
-                console.error('Error loading cameras:', error);
+                showStatus(`Error loading cameras: ${error.message}`, 'error');
             }
         }
         
-        // Handle smart filter change
+        function resetFeed() {
+            imageQueue = [];
+            queuedAssetIds.clear();
+            preloadedFullRes.clear();
+            currentId = null;
+            currentAsset = null;
+            lastAction = null;
+            if (preloadRetryTimer) {
+                clearTimeout(preloadRetryTimer);
+                preloadRetryTimer = null;
+            }
+            loadNext();
+        }
+
         function onSmartFilterChange() {
-            const select = document.getElementById('smartSelect');
-            selectedSmartQuery = select.value || null;
-            
-            // Clear queue and seen IDs when filter changes
-            imageQueue = [];
-            seenAssetIds.clear();
-            preloadedFullRes.clear();
-            currentId = null;
-            currentAsset = null;
-            lastAction = null;  // Clear undo history too
-            loadNext();
+            selectedSmartQuery = document.getElementById('smartSelect').value || null;
+            resetFeed();
         }
         
-        // Handle camera filter change
         function onCameraFilterChange() {
-            const select = document.getElementById('cameraSelect');
-            selectedCameras = Array.from(select.selectedOptions)
+            selectedCameras = Array.from(document.getElementById('cameraSelect').selectedOptions)
                 .map(opt => opt.value)
-                .filter(v => v); // Remove empty values
-            
-            // Clear queue and seen IDs when filter changes
-            imageQueue = [];
-            seenAssetIds.clear();
-            preloadedFullRes.clear();
-            currentId = null;
-            currentAsset = null;
-            lastAction = null;  // Clear undo history too
-            loadNext();
+                .filter(v => v);
+            resetFeed();
+        }
+
+        function buildNextUrl(count) {
+            let url = `/next?count=${count}`;
+            if (selectedSmartQuery) {
+                url += `&smart_query=${encodeURIComponent(selectedSmartQuery)}`;
+            } else if (selectedCameras.length > 0) {
+                url += `&cameras=${encodeURIComponent(selectedCameras.join(','))}`;
+            }
+            return url;
+        }
+
+        function scheduleQueueRefill(delayMs = QUEUE_REFILL_DELAY_MS) {
+            if (preloadRetryTimer) return;
+            preloadRetryTimer = setTimeout(() => {
+                preloadRetryTimer = null;
+                preloadQueue();
+            }, delayMs);
         }
         
-        // Preload next batch of images into queue
         async function preloadQueue() {
-            // Start preloading when queue drops below threshold, not just when empty
-            if (isPreloading || imageQueue.length >= PRELOAD_THRESHOLD) return;
+            if (isPreloading || imageQueue.length >= TARGET_QUEUE_SIZE) return;
             
             isPreloading = true;
             try {
-                // Fetch enough to fill the queue
-                const needed = QUEUE_SIZE - imageQueue.length;
-                let url = `/next?count=${needed}`;
-                if (selectedSmartQuery) {
-                    url += `&smart_query=${encodeURIComponent(selectedSmartQuery)}`;
-                } else if (selectedCameras.length > 0) {
-                    url += `&cameras=${encodeURIComponent(selectedCameras.join(','))}`;
-                }
+                const needed = Math.min(QUEUE_REFILL_BATCH, TARGET_QUEUE_SIZE - imageQueue.length);
+                if (needed <= 0) return;
+
+                const url = buildNextUrl(needed);
                 const r = await fetch(url);
                 const data = await r.json();
                 
                 if (data.error) {
-                    console.error('Preload error:', data.error);
-                    isPreloading = false;
+                    showStatus(`Preload error: ${data.error}`, 'error');
+                    scheduleQueueRefill(QUEUE_REFILL_ERROR_DELAY_MS);
                     return;
                 }
                 
                 if (data.done) {
-                    isPreloading = false;
                     return;
                 }
                 
-                // Add to queue and preload images (deduplicate)
                 const assets = data.assets || [data];
+                let added = 0;
                 for (const asset of assets) {
-                    // Skip if we've already seen this asset
-                    if (seenAssetIds.has(asset.id)) {
+                    if (!asset || !asset.id || queuedAssetIds.has(asset.id) || currentId === asset.id) {
                         continue;
                     }
-                    seenAssetIds.add(asset.id);
+                    queuedAssetIds.add(asset.id);
+                    added += 1;
                     
-                    // Preload thumbnail immediately (high priority)
-                    const thumbImg = new Image();
-                    thumbImg.src = asset.thumb_url;
+                    if (imageQueue.length < THUMB_PRELOAD_LIMIT) {
+                        const thumbImg = new Image();
+                        thumbImg.src = asset.thumb_url;
+                    }
                     
-                    // Preload full resolution only for the next few images (avoid bandwidth spikes)
                     if (asset.type !== 'VIDEO' && imageQueue.length <= FULL_RES_PRELOAD_LIMIT) {
                         if (!preloadedFullRes.has(asset.id)) {
                             preloadedFullRes.add(asset.id);
                             setTimeout(() => {
-                                preloadFullImage(asset.image_url).catch(() => {});
+                                preloadFullImage(asset.image_url).catch(() => console.debug('Background full-res preload failed'));
                             }, 50 * imageQueue.length);
                         }
                     }
@@ -1113,34 +1093,34 @@ async def root():
                     imageQueue.push(asset);
                 }
                 
-                // If we're still below threshold after this batch, immediately queue another
-                if (imageQueue.length < PRELOAD_THRESHOLD) {
-                    isPreloading = false;
-                    preloadQueue();
-                    return;
+                if (imageQueue.length < TARGET_QUEUE_SIZE) {
+                    if (added === 0) {
+                        scheduleQueueRefill(QUEUE_REFILL_ERROR_DELAY_MS);
+                    } else {
+                        scheduleQueueRefill();
+                    }
                 }
             } catch (error) {
-                console.error('Queue preload error:', error);
+                showStatus(`Queue error: ${error.message}`, 'error');
+                scheduleQueueRefill(QUEUE_REFILL_ERROR_DELAY_MS);
             } finally {
                 isPreloading = false;
             }
         }
         
-        // Get next image from queue or fetch if empty
         async function loadNext() {
-            // Trigger preload early (don't wait for queue to empty)
             preloadQueue();
             
-            // If queue has images, use them immediately (instant switch)
             if (imageQueue.length > 0) {
                 const asset = imageQueue.shift();
+                queuedAssetIds.delete(asset.id);
                 currentId = asset.id;
-                currentAsset = asset;  // Store for undo
+                currentAsset = asset;
                 displayImage(asset);
+                scheduleQueueRefill();
                 return;
             }
             
-            // Queue empty - clear current image before fetching
             const photo = document.getElementById('photo');
             const video = document.getElementById('video');
             photo.style.display = 'none';
@@ -1152,18 +1132,11 @@ async def root():
             document.getElementById('queueInfo').textContent = 'queue: 0';
             setLoading(true);
             preloadedFullRes.clear();
+            queuedAssetIds.clear();
             
             try {
-                let url = '/next';
-                const params = [];
-                if (selectedSmartQuery) {
-                    params.push(`smart_query=${encodeURIComponent(selectedSmartQuery)}`);
-                } else if (selectedCameras.length > 0) {
-                    params.push(`cameras=${encodeURIComponent(selectedCameras.join(','))}`);
-                }
-                if (params.length > 0) {
-                    url += '?' + params.join('&');
-                }
+                const neededNow = Math.max(QUEUE_REFILL_BATCH, 4);
+                const url = buildNextUrl(neededNow);
                 const r = await fetch(url);
                 const data = await r.json();
                 
@@ -1177,44 +1150,55 @@ async def root():
                     document.getElementById('empty').style.display = 'block';
                     document.getElementById('photo').style.display = 'none';
                     document.getElementById('video').style.display = 'none';
+                    queuedAssetIds.clear();
                     currentId = null;
                     currentAsset = null;
                     setLoading(false);
                     return;
                 }
                 
-                // Track seen asset
-                if (!seenAssetIds.has(data.id)) {
-                    seenAssetIds.add(data.id);
+                const assets = data.assets || [data];
+                if (!assets || assets.length === 0) {
+                    setLoading(false);
+                    return;
                 }
-                
-                currentId = data.id;
-                currentAsset = data;  // Store for undo
-                displayImage(data);
-                
-                // Start preloading queue for next images
-                preloadQueue();
+
+                const first = assets[0];
+                const rest = assets.slice(1);
+
+                for (const asset of rest) {
+                    if (!asset || !asset.id || queuedAssetIds.has(asset.id) || currentId === asset.id) continue;
+                    queuedAssetIds.add(asset.id);
+                    if (imageQueue.length < THUMB_PRELOAD_LIMIT) {
+                        const thumbImg = new Image();
+                        thumbImg.src = asset.thumb_url;
+                    }
+                    imageQueue.push(asset);
+                }
+
+                currentId = first.id;
+                currentAsset = first;
+                displayImage(first);
+
+                scheduleQueueRefill();
             } catch (error) {
                 showStatus(`Error: ${error.message}`, 'error');
                 setLoading(false);
+                scheduleQueueRefill(QUEUE_REFILL_ERROR_DELAY_MS);
             }
         }
         
-        // Undo stack - stores full asset data for restoration
         let lastAction = null;
-        let currentAsset = null;  // Store current asset for undo
+        let currentAsset = null;
         
-        // Add entry to history (keeps last 10)
         function addHistoryEntry(action, asset) {
             const historyList = document.getElementById('historyList');
             const emptyMsg = historyList.querySelector('.history-empty');
             
-            // Remove empty message if present
             if (emptyMsg) {
                 emptyMsg.remove();
             }
             
-            // Create history entry
             const entry = document.createElement('div');
             entry.className = 'history-entry success';
             
@@ -1226,14 +1210,7 @@ async def root():
                 second: '2-digit'
             });
             
-            const actionNames = {
-                'delete': 'del',
-                'keep': 'skip',
-                'fav': 'fav',
-                'archive': 'archive'
-            };
-            
-            const actionLabel = actionNames[action] || action;
+            const actionLabel = ACTION_NAMES[action] || action;
             const filename = asset?.meta?.filename || asset?.id?.slice(0, 8) || 'unknown';
             
             entry.innerHTML = `
@@ -1241,10 +1218,8 @@ async def root():
                 <span class="history-time">${timeStr}</span>
             `;
             
-            // Add to top of list (newest first)
             historyList.insertBefore(entry, historyList.firstChild);
             
-            // Keep only last 10 entries (remove oldest)
             const entries = historyList.querySelectorAll('.history-entry');
             if (entries.length > 10) {
                 entries[entries.length - 1].remove();
@@ -1254,40 +1229,37 @@ async def root():
         async function sendAction(action) {
             if (!currentId || !currentAsset) return;
             
-            const actionNames = {
-                'delete': 'del',
-                'keep': 'skip',
-                'fav': 'fav',
-                'archive': 'archive'
-            };
-            
-            // Store full asset data for undo (so we can restore the UI)
             lastAction = { 
                 asset: currentAsset,
                 action: action 
             };
             
-            const actionLabel = actionNames[action] || action;
+            const actionLabel = ACTION_NAMES[action] || action;
             
-            // Add to history
             addHistoryEntry(action, currentAsset);
 
             updateStatsLocal(action, 1);
             
-            // Send action in background, don't wait
-            fetch(`/action/${currentId}?action=${action}`, {
-                method: 'POST'
-            }).catch(error => {
-                console.error('Action error:', error);
-                showStatus(`Error: ${error.message}`, 'error');
-                fetchStats();
-            });
-
-            setTimeout(() => fetchStats(), 0);
+            (async () => {
+                try {
+                    const r = await fetch(`/action/${currentId}?action=${action}`, { method: 'POST' });
+                    const data = await r.json();
+                    if (!r.ok || data.error) {
+                        updateStatsLocal(action, -1);
+                        showStatus(`failed: ${data.error || `http ${r.status}`}`, 'error');
+                        fetchStats();
+                        return;
+                    }
+                    applyServerStats(data.stats);
+                } catch (error) {
+                    updateStatsLocal(action, -1);
+                    showStatus(`Error: ${error.message}`, 'error');
+                    fetchStats();
+                }
+            })();
             
             showStatus(`${actionLabel} [ctrl+z undo]`, 'success');
             
-            // Immediately load next (should be instant from queue)
             loadNext();
         }
         
@@ -1307,12 +1279,10 @@ async def root():
                 if (data.error) {
                     showStatus(`undo failed: ${data.error}`, 'error');
                 } else {
-                    // Put current image back into queue front
                     if (currentAsset) {
                         imageQueue.unshift(currentAsset);
                     }
                     
-                    // Restore the undone asset to the UI
                     currentId = asset.id;
                     currentAsset = asset;
                     displayImage(asset);
@@ -1320,7 +1290,7 @@ async def root():
                     showStatus(`undone - vote again`, 'success');
                     lastAction = null;
                     updateStatsLocal(action, -1);
-                    fetchStats();
+                    applyServerStats(data.stats);
                 }
             } catch (error) {
                 showStatus(`undo failed: ${error.message}`, 'error');
@@ -1328,29 +1298,25 @@ async def root():
         }
         
         document.addEventListener('keydown', e => {
-            // Undo: ctrl+z or cmd+z
             if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
                 e.preventDefault();
                 undoLast();
                 return;
             }
             
-            if (e.key === 'ArrowLeft') sendAction('delete');
-            if (e.key === 'ArrowRight') sendAction('keep');
-            if (e.key === 'ArrowUp') sendAction('fav');
-            if (e.key === 'ArrowDown') sendAction('archive');
+            if (e.key === 'ArrowLeft') { e.preventDefault(); sendAction('delete'); }
+            if (e.key === 'ArrowRight') { e.preventDefault(); sendAction('keep'); }
+            if (e.key === 'ArrowUp') { e.preventDefault(); sendAction('fav'); }
+            if (e.key === 'ArrowDown') { e.preventDefault(); sendAction('archive'); }
         });
         
-        // Initialize: load first image immediately, cameras in background
         document.getElementById('smartSelect').addEventListener('change', onSmartFilterChange);
         document.getElementById('cameraSelect').addEventListener('change', onCameraFilterChange);
         
-        // Load first image immediately (don't wait for cameras)
         loadNext();
 
         fetchStats();
         
-        // Load cameras in background (non-blocking)
         setTimeout(() => loadCameras(), 100);
     </script>
 </body>
@@ -1359,7 +1325,6 @@ async def root():
 
 @app.get("/favicon.ico")
 async def favicon():
-    """Serve favicon"""
     favicon_path = Path(__file__).parent.parent / "frontend" / "favicon.ico"
     if favicon_path.exists():
         return FileResponse(favicon_path)
@@ -1367,7 +1332,6 @@ async def favicon():
 
 @app.get("/cameras")
 async def get_cameras():
-    """Get list of available camera models"""
     try:
         logger.info("Fetching camera models")
         cameras = await immich.get_camera_models()
@@ -1379,190 +1343,245 @@ async def get_cameras():
 
 @app.get("/stats")
 async def get_stats():
-    """Get persistent action stats"""
     return await read_stats()
 
-@app.get("/smart-search-status")
-async def smart_search_status():
-    """Check if smart search is available and working"""
-    try:
-        logger.info("Checking smart search availability")
-        # Try a simple test query
-        test_results = await immich.search_smart(query="test", limit=1, filter_by_dimensions=False)
-        return {
-            "available": True,
-            "working": len(test_results) >= 0,  # Even empty results means it's working
-            "message": "Smart search is available"
-        }
-    except Exception as e:
-        logger.warning(f"Smart search check failed: {e}")
-        return {
-            "available": False,
-            "working": False,
-            "error": str(e),
-            "message": "Smart search may not be available or configured"
-        }
+def _feed_key(cameras: str | None = None, smart_query: str | None = None) -> str:
+    if smart_query:
+        return f"smart:{smart_query.strip().lower()}"
+    if cameras:
+        normalized = ",".join(sorted(c.strip() for c in cameras.split(",") if c.strip()))
+        return f"camera:{normalized}" if normalized else "all"
+    return "all"
+
+def _format_asset(asset: AssetInput) -> AssetFormatted:
+    if not asset or not isinstance(asset, dict):
+        logger.error(f"Invalid asset format: {type(asset)}, value: {asset}")
+        raise ValueError(f"Invalid asset: expected dict, got {type(asset)}")
+    if "id" not in asset:
+        logger.error(f"Asset missing 'id' field. Available keys: {list(asset.keys())}")
+        raise ValueError(f"Asset missing 'id' field. Available keys: {list(asset.keys())}")
+    exif: ExifInfo = asset.get("exifInfo", {}) or {}  # type: ignore[assignment]
+    return {
+        "id": asset["id"],
+        "type": asset.get("type", "IMAGE"),
+        "duration": asset.get("duration", "0:00:00.00000"),
+        "thumb_url": f"/proxy/{asset['id']}/thumbnail",
+        "image_url": f"/proxy/{asset['id']}/original",
+        "video_url": f"/proxy/{asset['id']}/original" if asset.get("type") == "VIDEO" else None,
+        "meta": {
+            "filename": asset.get("originalFileName", "--"),
+            "date": asset.get("fileCreatedAt", "")[:10] if asset.get("fileCreatedAt") else "--",
+            "time": asset.get("fileCreatedAt", "")[11:16] if asset.get("fileCreatedAt") else "--",
+            "size": f"{(exif.get('fileSizeInByte', 0) or 0) / 1024 / 1024:.1f} MB" if exif.get('fileSizeInByte') else "--",
+            "dims": f"{exif.get('exifImageWidth', '--')}x{exif.get('exifImageHeight', '--')}" if exif.get('exifImageWidth') else "--",
+            "camera": exif.get("model", "--") or "--",
+            "lens": exif.get("lensModel", "--") or "--",
+            "iso": str(exif.get("iso", "--")) if exif.get("iso") else "--",
+            "aperture": str(exif.get("fNumber", "--")) if exif.get("fNumber") else "--",
+            "shutter": exif.get("exposureTime", "--") or "--",
+            "focal": f"{exif.get('focalLength', '--')}mm" if exif.get("focalLength") else "--",
+            "location": exif.get("city", "") or exif.get("state", "") or exif.get("country", "") or "--",
+        },
+    }
 
 @app.get("/next")
-async def next_image(count: int = 1, cameras: str = None, smart_query: str = None):
-    """Get next image(s) - supports batch loading for queue, camera filtering, and smart search"""
+async def next_image(count: int = 1, cameras: str | None = None, smart_query: str | None = None):
     try:
-        # Smart search takes priority if provided
-        if smart_query:
-            logger.info(f"Fetching {count} asset(s) using smart search: '{smart_query}'")
-            # Use dimension filtering for screenshots to improve accuracy
-            filter_by_dims = smart_query.lower() == "screenshot"
-            assets = await immich.search_smart(query=smart_query, limit=count, filter_by_dimensions=filter_by_dims)
-        else:
-            camera_list = None
-            if cameras:
-                camera_list = [c.strip() for c in cameras.split(",") if c.strip()]
-                logger.info(f"Fetching {count} asset(s) filtered by cameras: {camera_list}")
+        requested = max(1, min(int(count), 24))
+        camera_list = [c.strip() for c in cameras.split(",") if c.strip()] if cameras else []
+        feed_key = _feed_key(cameras=cameras, smart_query=smart_query)
+        selected_assets = []
+        selected_ids = set()
+
+        async with feed_lock:
+            if smart_query:
+                logger.info(f"Fetching {requested} asset(s) using smart search feed '{feed_key}'")
+                filter_by_dims = smart_query.lower() == "screenshot"
+                fetch_size = max(requested * 4, 24)
+                candidates = await immich.search_smart(
+                    query=smart_query,
+                    limit=fetch_size,
+                    filter_by_dimensions=filter_by_dims,
+                )
+                candidate_ids = [asset.get("id") for asset in candidates if isinstance(asset, dict) and asset.get("id")]
+                unseen_ids = set(state_store.filter_unseen(candidate_ids, COOLDOWN_DAYS))
+                random.shuffle(candidates)
+                for asset in candidates:
+                    asset_id = asset.get("id")
+                    if asset_id in unseen_ids and asset_id not in selected_ids:
+                        selected_assets.append(asset)
+                        selected_ids.add(asset_id)
+                    if len(selected_assets) >= requested:
+                        break
             else:
-                logger.info(f"Fetching {count} asset(s) from Immich")
-            
-            if camera_list:
-                assets = await immich.get_unreviewed_filtered(limit=count, camera_models=camera_list)
-            else:
-                assets = await immich.get_unreviewed(limit=count)
-        
-        if not assets or len(assets) == 0:
+                start_page = state_store.get_feed_cursor(feed_key)
+                page = start_page
+                max_page_fetches = 12
+                target_pool = max(requested * 3, 24)
+                candidate_pool = []
+
+                for _ in range(max_page_fetches):
+                    try:
+                        page_assets = await immich.get_assets_page(
+                            page=page,
+                            size=100,
+                            camera_models=camera_list or None,
+                        )
+                    except Exception as exc:
+                        logger.warning(f"Deterministic paging failed for '{feed_key}' on page {page}: {exc}")
+                        page_assets = []
+                    page += 1
+                    if not page_assets:
+                        continue
+                    candidate_pool.extend(page_assets)
+                    if len(candidate_pool) >= target_pool:
+                        break
+
+                state_store.set_feed_cursor(feed_key, page)
+
+                if not candidate_pool:
+                    fallback_limit = max(requested * 2, 12)
+                    if camera_list:
+                        candidate_pool = await immich.get_unreviewed_filtered(limit=fallback_limit, camera_models=camera_list)
+                    else:
+                        candidate_pool = await immich.get_unreviewed(limit=fallback_limit)
+
+                candidate_ids = [asset.get("id") for asset in candidate_pool if isinstance(asset, dict) and asset.get("id")]
+                unseen_ids = set(state_store.filter_unseen(candidate_ids, COOLDOWN_DAYS))
+                random.shuffle(candidate_pool)
+                for asset in candidate_pool:
+                    asset_id = asset.get("id")
+                    if asset_id in unseen_ids and asset_id not in selected_ids:
+                        selected_assets.append(asset)
+                        selected_ids.add(asset_id)
+                    if len(selected_assets) >= requested:
+                        break
+
+            if selected_assets:
+                state_store.mark_seen([asset["id"] for asset in selected_assets if isinstance(asset, dict) and asset.get("id")])
+
+        if not selected_assets:
             logger.info("No more assets available")
             return {"done": True}
-        
-        # Log first asset structure for debugging
-        if assets and len(assets) > 0:
-            logger.info(f"First asset keys: {list(assets[0].keys()) if isinstance(assets[0], dict) else 'not a dict'}")
-            logger.info(f"First asset sample: {str(assets[0])[:200] if isinstance(assets[0], dict) else assets[0]}")
-        
-        # Always return consistent format with metadata
-        def format_asset(asset):
-            if not asset or not isinstance(asset, dict):
-                logger.error(f"Invalid asset format: {type(asset)}, value: {asset}")
-                raise ValueError(f"Invalid asset: expected dict, got {type(asset)}")
-            
-            if "id" not in asset:
-                logger.error(f"Asset missing 'id' field. Available keys: {list(asset.keys())}")
-                logger.error(f"Asset content: {asset}")
-                raise ValueError(f"Asset missing 'id' field. Available keys: {list(asset.keys())}")
-            
-            exif = asset.get("exifInfo", {}) or {}
-            return {
-                "id": asset["id"],
-                "type": asset.get("type", "IMAGE"),
-                "duration": asset.get("duration", "0:00:00.00000"),
-                "thumb_url": f"/proxy/{asset['id']}/thumbnail",
-                "image_url": f"/proxy/{asset['id']}/original",
-                "video_url": f"/proxy/{asset['id']}/original" if asset.get("type") == "VIDEO" else None,
-                "meta": {
-                    "filename": asset.get("originalFileName", "--"),
-                    "date": asset.get("fileCreatedAt", "")[:10] if asset.get("fileCreatedAt") else "--",
-                    "time": asset.get("fileCreatedAt", "")[11:16] if asset.get("fileCreatedAt") else "--",
-                    "size": f"{(exif.get('fileSizeInByte', 0) or 0) / 1024 / 1024:.1f} MB" if exif.get('fileSizeInByte') else "--",
-                    "dims": f"{exif.get('exifImageWidth', '--')}x{exif.get('exifImageHeight', '--')}" if exif.get('exifImageWidth') else "--",
-                    "camera": exif.get("model", "--") or "--",
-                    "lens": exif.get("lensModel", "--") or "--",
-                    "iso": str(exif.get("iso", "--")) if exif.get("iso") else "--",
-                    "aperture": str(exif.get("fNumber", "--")) if exif.get("fNumber") else "--",
-                    "shutter": exif.get("exposureTime", "--") or "--",
-                    "focal": f"{exif.get('focalLength', '--')}mm" if exif.get("focalLength") else "--",
-                    "location": exif.get("city", "") or exif.get("state", "") or exif.get("country", "") or "--",
-                }
-            }
-        
-        formatted_assets = [format_asset(asset) for asset in assets]
-        
+
+        formatted_assets = [_format_asset(asset) for asset in selected_assets]
         asset_types = [a["type"] for a in formatted_assets]
         logger.info(f"Returning {len(formatted_assets)} asset(s): {asset_types}")
         
-        if count == 1:
-            # For single requests, return the asset directly (backward compatible)
+        if requested == 1:
             return formatted_assets[0]
         else:
-            # For batch requests, return array
             return {"assets": formatted_assets}
     except Exception as e:
         logger.error(f"Error fetching assets: {e}", exc_info=True)
         return {"error": str(e), "type": type(e).__name__}
 
 @app.get("/proxy/{asset_id}/{size}")
-async def proxy_image(asset_id: str, size: str):
-    """Proxy images/videos through backend to add API key authentication"""
+async def proxy_image(asset_id: str, size: str, request: Request):
     logger.debug(f"Proxying {size} for asset {asset_id}")
+    upstream_url = f"{immich.base}/assets/{asset_id}/{size}"
+    request_headers = {}
+    range_header = request.headers.get("range")
+    if range_header:
+        request_headers["range"] = range_header
+
+    stream_context = None
     try:
-        # Use retry logic for proxy requests too
-        r = await immich.get_with_retry(f"{immich.base}/assets/{asset_id}/{size}", max_retries=1)
-        from fastapi.responses import Response
-        
-        # Determine content type from response headers or size parameter
-        content_type = r.headers.get("content-type", "image/jpeg")
-        content_length = len(r.content)
-        if size == "original":
-            # For original, check if it might be a video
-            # Immich typically serves videos with video/* content type
-            if "video" in content_type.lower():
-                content_type = content_type
-            elif not content_type.startswith("image/"):
-                # Fallback: check file extension or assume video for large files
-                content_type = "video/mp4"  # Common video format
-        
-        logger.debug(f"Serving {size} for {asset_id}: {content_type}, {content_length} bytes")
-        return Response(content=r.content, media_type=content_type)
+        stream_context = immich.stream_with_retry(
+            upstream_url,
+            max_retries=1,
+            headers=request_headers or None,
+            media=True,
+        )
+        upstream = await stream_context.__aenter__()
+        content_type = upstream.headers.get("content-type", "application/octet-stream")
+        if size == "original" and "video" not in content_type.lower() and not content_type.startswith("image/"):
+            content_type = "video/mp4"
+
+        response_headers = {}
+        passthrough_headers = ("accept-ranges", "content-range", "content-length", "etag", "last-modified", "cache-control")
+        for key in passthrough_headers:
+            value = upstream.headers.get(key)
+            if value:
+                response_headers[key] = value
+
+        async def stream_body():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    if chunk:
+                        yield chunk
+            finally:
+                if stream_context is not None:
+                    await stream_context.__aexit__(None, None, None)
+
+        logger.debug(f"Streaming {size} for {asset_id}: {content_type}")
+        return StreamingResponse(
+            stream_body(),
+            status_code=upstream.status_code,
+            media_type=content_type,
+            headers=response_headers,
+        )
     except Exception as e:
+        if stream_context is not None:
+            await stream_context.__aexit__(type(e), e, e.__traceback__)
         logger.error(f"Error proxying {size} for {asset_id}: {e}", exc_info=True)
         raise
 
+@app.post("/admin/seen/reset")
+async def reset_seen_assets():
+    state_store.clear_seen()
+    return {"ok": True}
+
 @app.post("/action/{asset_id}")
-async def action(asset_id: str, action: str):
+async def action(asset_id: str, action: ActionLiteral) -> ActionResponse:
     logger.info(f"Action '{action}' on asset {asset_id}")
     try:
+        updated_stats = None
         if action == "delete":
             await immich.delete(asset_id)
             logger.info(f"Deleted asset {asset_id}")
-            await update_stats(action, 1)
+            updated_stats = await update_stats(action, 1)
         elif action == "fav":
             await immich.mark_favorite(asset_id, True)
             logger.info(f"Favorited asset {asset_id}")
-            await update_stats(action, 1)
+            updated_stats = await update_stats(action, 1)
         elif action == "archive":
             await immich.archive(asset_id, True)
             logger.info(f"Archived asset {asset_id}")
-            await update_stats(action, 1)
+            updated_stats = await update_stats(action, 1)
         elif action == "keep":
-            # keep does nothing, just moves to next
             logger.info(f"Kept asset {asset_id}")
-            await update_stats(action, 1)
+            updated_stats = await update_stats(action, 1)
         else:
             logger.warning(f"Unknown action: {action} for asset {asset_id}")
             return {"error": "unknown action"}
-        return {"ok": True}
+        return {"ok": True, "stats": updated_stats}
     except Exception as e:
         logger.error(f"Error performing action '{action}' on {asset_id}: {e}", exc_info=True)
         return {"error": str(e), "type": type(e).__name__}
 
 @app.post("/undo/{asset_id}")
-async def undo_action(asset_id: str, action: str):
-    """Undo a previous action"""
+async def undo_action(asset_id: str, action: ActionLiteral) -> ActionResponse:
     logger.info(f"Undo '{action}' on asset {asset_id}")
     try:
+        updated_stats = None
         if action == "delete":
             await immich.restore(asset_id)
             logger.info(f"Restored asset {asset_id} from trash")
-            await update_stats(action, -1)
+            updated_stats = await update_stats(action, -1)
         elif action == "fav":
             await immich.mark_favorite(asset_id, False)
             logger.info(f"Unfavorited asset {asset_id}")
-            await update_stats(action, -1)
+            updated_stats = await update_stats(action, -1)
         elif action == "archive":
             await immich.archive(asset_id, False)
             logger.info(f"Unarchived asset {asset_id}")
-            await update_stats(action, -1)
+            updated_stats = await update_stats(action, -1)
         elif action == "keep":
-            # nothing to undo
-            await update_stats(action, -1)
+            updated_stats = await update_stats(action, -1)
         else:
             return {"error": "unknown action"}
-        return {"ok": True}
+        return {"ok": True, "stats": updated_stats}
     except Exception as e:
         logger.error(f"Error undoing '{action}' on {asset_id}: {e}", exc_info=True)
         return {"error": str(e), "type": type(e).__name__}

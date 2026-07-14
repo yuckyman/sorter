@@ -33,3 +33,6 @@ logs/
 # Python artifacts
 venv/
 __pycache__/
+sorter.db
+sorter.db-shm
+sorter.db-wal

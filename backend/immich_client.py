@@ -1,41 +1,80 @@
+from __future__ import annotations
+
 import httpx
 import asyncio
+import logging
+from contextlib import asynccontextmanager
+from typing import Any
+
+from models import AssetInput
+
 
 class ImmichClient:
-    def __init__(self, base_url, api_key):
+    def __init__(self, base_url: str, api_key: str) -> None:
         self.base = base_url.rstrip("/")
         self.headers = {"x-api-key": api_key}
-        # Reuse single client with connection pooling for efficiency
         self.client = httpx.AsyncClient(
             headers=self.headers,
-            timeout=httpx.Timeout(60.0, connect=15.0),  # 60s total, 15s connect (increased for slow responses)
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),  # Increased for better parallel performance
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
         )
-        self._camera_cache = None
-        # Semaphore to limit concurrent requests (increased for better batch performance)
-        self._semaphore = asyncio.Semaphore(6)  # Max 6 concurrent requests
-    
-    async def get_with_retry(self, url, max_retries=2):
-        """Get with retry logic and semaphore limiting"""
+        self._camera_cache: list[str] | None = None
+        # Separate lanes so proxy streaming does not starve metadata requests.
+        self._metadata_semaphore = asyncio.Semaphore(3)
+        self._media_semaphore = asyncio.Semaphore(2)
+
+    def _semaphore_for(self, media: bool = False) -> asyncio.Semaphore:
+        return self._media_semaphore if media else self._metadata_semaphore
+
+    async def get_with_retry(
+        self,
+        url: str,
+        max_retries: int = 2,
+        headers: dict[str, str] | None = None,
+        media: bool = False,
+    ) -> httpx.Response:
         for attempt in range(max_retries + 1):
-            async with self._semaphore:
+            async with self._semaphore_for(media=media):
                 try:
-                    r = await self.client.get(url)
+                    r = await self.client.get(url, headers=headers)
                     r.raise_for_status()
                     return r
-                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError):
                     if attempt < max_retries:
-                        wait_time = 0.5 * (2 ** attempt)  # Exponential backoff: 0.5s, 1s
+                        wait_time = 0.5 * (2 ** attempt)
                         await asyncio.sleep(wait_time)
                         continue
                     raise
-                except Exception:
-                    raise
-    
-    async def _request_with_retry(self, method, url, max_retries=1, **kwargs):
-        """Generic request with retry logic for PUT/POST/DELETE"""
+
+    @asynccontextmanager
+    async def stream_with_retry(
+        self,
+        url: str,
+        max_retries: int = 1,
+        headers: dict[str, str] | None = None,
+        media: bool = False,
+    ):
         for attempt in range(max_retries + 1):
-            async with self._semaphore:
+            semaphore = self._semaphore_for(media=media)
+            await semaphore.acquire()
+            try:
+                async with self.client.stream("GET", url, headers=headers) as response:
+                    response.raise_for_status()
+                    yield response
+                    return
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError):
+                if attempt < max_retries:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    continue
+                raise
+            finally:
+                semaphore.release()
+
+    async def _request_with_retry(
+        self, method: str, url: str, max_retries: int = 1, **kwargs: Any
+    ) -> httpx.Response:
+        for attempt in range(max_retries + 1):
+            async with self._metadata_semaphore:
                 try:
                     if method == "PUT":
                         r = await self.client.put(url, **kwargs)
@@ -47,118 +86,150 @@ class ImmichClient:
                         r = await self.client.request(method, url, **kwargs)
                     r.raise_for_status()
                     return r
-                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError):
                     if attempt < max_retries:
-                        wait_time = 0.3 * (2 ** attempt)  # Shorter backoff for actions
+                        wait_time = 0.3 * (2 ** attempt)
                         await asyncio.sleep(wait_time)
                         continue
                     raise
-                except Exception:
-                    raise
-    
-    async def close(self):
-        """Close the client connection pool"""
+
+    def _extract_assets(self, data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict) and item.get("id")]
+        if isinstance(data, dict):
+            for key in ("assets", "items", "results"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict) and item.get("id")]
+            if data.get("id"):
+                return [data]
+        return []
+
+    async def get_assets_page(
+        self,
+        page: int = 1,
+        size: int = 120,
+        camera_models: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        safe_page = max(1, int(page))
+        safe_size = max(1, min(int(size), 250))
+        camera_set = set(camera_models or [])
+
+        payload = {
+            "page": safe_page,
+            "size": safe_size,
+            "order": "desc",
+            "isTrashed": False,
+            "isArchived": False,
+        }
+
+        response = await self._request_with_retry(
+            "POST",
+            f"{self.base}/search/metadata",
+            max_retries=1,
+            json=payload,
+        )
+        assets = self._extract_assets(response.json())
+        if camera_set:
+            assets = [
+                a for a in assets
+                if ((a.get("exifInfo", {}) or {}).get("model") or "--") in camera_set
+            ]
+        return assets
+
+    async def close(self) -> None:
         await self.client.aclose()
 
-    async def get_unreviewed(self, limit=1):
-        # use the random endpoint which works with this Immich version
-        # fetch multiple in parallel if limit > 1
+    def _safe_json(self, response: httpx.Response) -> dict[str, Any]:
+        content = response.content or b""
+        if not content:
+            return {}
+        try:
+            return response.json()
+        except Exception:
+            return {}
+
+    async def get_unreviewed(self, limit: int = 1) -> list[dict[str, Any]]:
         if limit == 1:
             r = await self.get_with_retry(f"{self.base}/assets/random")
             data = r.json()
-            # random endpoint returns a single asset or list
-            if isinstance(data, list):
-                return data[:limit]
-            else:
-                return [data]  # wrap single asset in list
-        else:
-            # Fetch multiple random assets in parallel for better performance
-            assets = []
-            seen_ids = set()
-            max_attempts = limit * 3  # Try up to 3x limit to account for duplicates
-            
-            async def fetch_one_asset():
-                """Fetch a single random asset"""
-                try:
-                    r = await self.get_with_retry(f"{self.base}/assets/random")
-                    data = r.json()
-                    asset = data if isinstance(data, dict) else data[0] if isinstance(data, list) else None
-                    return asset
-                except Exception:
-                    return None
-            
-            # Fetch in parallel batches
-            pending = set()
-            while len(assets) < limit and len(seen_ids) < max_attempts:
-                # Start new requests if we have capacity
-                while len(pending) < 6 and len(seen_ids) < max_attempts:
-                    task = asyncio.create_task(fetch_one_asset())
-                    pending.add(task)
-                
-                if not pending:
-                    break
-                
-                # Wait for at least one to complete
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                
-                for task in done:
-                    asset = await task
-                    if asset and asset.get("id") and asset.get("id") not in seen_ids:
-                        seen_ids.add(asset["id"])
-                        assets.append(asset)
-                        if len(assets) >= limit:
-                            # Cancel remaining tasks
-                            for t in pending:
-                                t.cancel()
-                            pending.clear()
-                            break
-            
-            return assets[:limit]
+            return data if isinstance(data, list) else [data]
 
-    async def mark_favorite(self, asset_id, favorite=True):
+        assets: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        max_attempts = limit * 3
+        attempts = 0
+
+        async def fetch_one() -> dict[str, Any] | None:
+            try:
+                r = await self.get_with_retry(f"{self.base}/assets/random")
+                data = r.json()
+                return data if isinstance(data, dict) else data[0] if isinstance(data, list) else None
+            except Exception:
+                return None
+
+        pending: set[asyncio.Task[dict[str, Any] | None]] = set()
+        while len(assets) < limit and attempts < max_attempts:
+            while len(pending) < 6 and attempts < max_attempts:
+                pending.add(asyncio.create_task(fetch_one()))
+                attempts += 1
+
+            if not pending:
+                break
+
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                asset = await task
+                if asset and asset.get("id") not in seen_ids:
+                    seen_ids.add(asset["id"])
+                    assets.append(asset)
+                    if len(assets) >= limit:
+                        for t in pending:
+                            t.cancel()
+                        pending.clear()
+                        break
+
+        return assets[:limit]
+
+    async def mark_favorite(self, asset_id: str, favorite: bool = True) -> dict[str, Any]:
         r = await self._request_with_retry(
             "PUT",
             f"{self.base}/assets",
             json={"ids": [asset_id], "isFavorite": favorite},
         )
-        return r.json()
+        return self._safe_json(r)
 
-    async def archive(self, asset_id, archived=True):
+    async def archive(self, asset_id: str, archived: bool = True) -> dict[str, Any]:
         r = await self._request_with_retry(
             "PUT",
             f"{self.base}/assets",
             json={"ids": [asset_id], "isArchived": archived},
         )
-        return r.json()
+        return self._safe_json(r)
 
-    async def delete(self, asset_id):
+    async def delete(self, asset_id: str) -> dict[str, Any]:
         r = await self._request_with_retry(
             "DELETE",
             f"{self.base}/assets",
             json={"ids": [asset_id]},
         )
-        return r.json()
+        return self._safe_json(r)
 
-    async def restore(self, asset_id):
-        """Restore asset from trash"""
+    async def restore(self, asset_id: str) -> dict[str, Any]:
         r = await self._request_with_retry(
             "POST",
             f"{self.base}/trash/restore/assets",
             json={"ids": [asset_id]},
         )
-        return r.json()
+        return self._safe_json(r)
 
-    async def get_camera_models(self, sample_size=8):
-        """Get unique camera models by sampling assets (cached, lazy-loaded)"""
+    async def get_camera_models(self, sample_size: int = 8) -> list[str]:
         if self._camera_cache is not None:
             return self._camera_cache
-        
-        # Very conservative: process one at a time with delays
-        total_samples = min(sample_size, 8)
-        cameras = set()
-        
-        # Fetch in parallel for faster camera discovery
-        async def fetch_camera():
+
+        cameras: set[str] = set()
+
+        async def fetch_camera() -> str | None:
             try:
                 r = await self.get_with_retry(f"{self.base}/assets/random")
                 data = r.json()
@@ -171,235 +242,148 @@ class ImmichClient:
             except Exception:
                 pass
             return None
-        
-        # Fetch all samples in parallel
-        tasks = [fetch_camera() for _ in range(total_samples)]
+
+        tasks = [fetch_camera() for _ in range(min(sample_size, 8))]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         for result in results:
             if result and not isinstance(result, Exception):
                 cameras.add(result)
-        
-        self._camera_cache = sorted(list(cameras))
+
+        self._camera_cache = sorted(cameras)
         return self._camera_cache
 
-    async def get_unreviewed_filtered(self, limit=1, camera_models=None):
-        """Get unreviewed assets, optionally filtered by camera models"""
-        if not camera_models or len(camera_models) == 0:
+    async def get_unreviewed_filtered(
+        self, limit: int = 1, camera_models: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        if not camera_models:
             return await self.get_unreviewed(limit=limit)
-        
-        # Fetch in parallel for better performance
-        max_attempts = limit * 10  # Try up to 10x limit attempts
-        matching_assets = []
-        seen_ids = set()
-        
-        async def fetch_and_filter():
-            """Fetch a single random asset and check if it matches"""
+
+        camera_set = set(camera_models)
+        matching_assets: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        max_attempts = limit * 10
+        attempts = 0
+
+        async def fetch_and_filter() -> dict[str, Any] | None:
             try:
                 r = await self.get_with_retry(f"{self.base}/assets/random")
                 data = r.json()
                 asset = data if isinstance(data, dict) else data[0] if isinstance(data, list) else None
-                
-                if asset and asset.get("id") and asset.get("id") not in seen_ids:
+                if asset and asset.get("id") not in seen_ids:
                     seen_ids.add(asset.get("id"))
-                    exif = asset.get("exifInfo", {}) or {}
-                    camera = exif.get("model") or "--"
-                    
-                    if camera in camera_models:
+                    camera = (asset.get("exifInfo", {}) or {}).get("model") or "--"
+                    if camera in camera_set:
                         return asset
             except Exception:
                 pass
             return None
-        
-        # Fetch in parallel batches
-        pending = set()
-        while len(matching_assets) < limit and len(seen_ids) < max_attempts:
-            # Start new requests if we have capacity
-            while len(pending) < 6 and len(seen_ids) < max_attempts:
-                task = asyncio.create_task(fetch_and_filter())
-                pending.add(task)
-            
+
+        pending: set[asyncio.Task[dict[str, Any] | None]] = set()
+        while len(matching_assets) < limit and attempts < max_attempts:
+            while len(pending) < 6 and attempts < max_attempts:
+                pending.add(asyncio.create_task(fetch_and_filter()))
+                attempts += 1
+
             if not pending:
                 break
-            
-            # Wait for at least one to complete
+
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            
             for task in done:
                 asset = await task
                 if asset:
                     matching_assets.append(asset)
                     if len(matching_assets) >= limit:
-                        # Cancel remaining tasks
                         for t in pending:
                             t.cancel()
                         pending.clear()
                         break
-        
+
         return matching_assets[:limit]
 
-    def _is_screenshot_dimension(self, width, height):
-        """Check if dimensions match common screenshot resolutions"""
+    def _is_screenshot_dimension(self, width: int, height: int) -> bool:
         if not width or not height:
             return False
-        
-        # Common iPhone screenshot dimensions (portrait)
+
         iphone_screenshots = [
-            (1170, 2532),   # iPhone 13/14 Pro
-            (1284, 2778),   # iPhone 14 Pro Max
-            (1179, 2556),   # iPhone 15/16 Pro
-            (1290, 2796),   # iPhone 15/16 Pro Max
-            (750, 1334),    # iPhone SE
-            (1242, 2688),   # iPhone XS Max
-            (828, 1792),    # iPhone XR
+            (1170, 2532),
+            (1284, 2778),
+            (1179, 2556),
+            (1290, 2796),
+            (750, 1334),
+            (1242, 2688),
+            (828, 1792),
         ]
-        
-        # Check exact match or swapped (landscape screenshots)
+
         for w, h in iphone_screenshots:
             if (width == w and height == h) or (width == h and height == w):
                 return True
-        
-        # Check aspect ratio (most iPhone screenshots are ~19.5:9 or 16:9)
+
         aspect = width / height if height > 0 else 0
-        if 0.4 <= aspect <= 0.6:  # Portrait screenshots (tall)
+        if 0.4 <= aspect <= 0.6:
             return True
-        if 1.6 <= aspect <= 1.8:  # Landscape screenshots (wide)
+        if 1.6 <= aspect <= 1.8:
             return True
-        
+
         return False
-    
-    async def search_smart(self, query: str, limit: int = 1, filter_by_dimensions: bool = False):
-        """Search assets using Immich's smart search (CLIP-based semantic search)"""
-        import logging
+
+    async def search_smart(
+        self, query: str, limit: int = 1, filter_by_dimensions: bool = False
+    ) -> list[dict[str, Any]]:
         logger = logging.getLogger(__name__)
-        
-        # Improve query terms for better CLIP model understanding
+
         query_map = {
             "screenshot": "screenshot of phone screen mobile device",
             "selfie": "selfie portrait photo person face front camera",
             "portrait": "portrait photo person face",
             "landscape": "landscape scenery nature outdoor view",
-            "document": "document text paper scan"
+            "document": "document text paper scan",
         }
-        
-        # Use improved query if available, otherwise use original
+
         improved_query = query_map.get(query.lower(), query)
-        logger.info(f"Smart search query: '{query}' -> '{improved_query}'")
-        
+        request_size = limit * 5 if filter_by_dimensions else limit
+
+        body = {
+            "query": improved_query,
+            "size": request_size,
+            "isArchived": False,
+            "isTrashed": False,
+        }
+
         try:
-            # Use the searchSmart endpoint with POST and a body
-            # Try /search/smart first, fall back to /search-smart if needed
-            search_urls = [
-                f"{self.base}/search/smart",
-                f"{self.base}/search-smart"
-            ]
-            
-            # Request more results if we need to filter by dimensions
-            request_size = limit * 5 if filter_by_dimensions else limit
-            
-            body = {
-                "query": improved_query,
-                "size": request_size,
-                "isArchived": False,
-                "isTrashed": False
-            }
-            
-            last_error = None
-            for search_url in search_urls:
-                try:
-                    logger.info(f"Smart search request: {search_url} with query: {query}")
-                    r = await self._request_with_retry("POST", search_url, max_retries=2, json=body)
-                    data = r.json()
-                    
-                    logger.info(f"Smart search response type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
-                    
-                    # searchSmart returns a dict with items array or count/items structure
-                    if isinstance(data, dict):
-                        if "items" in data:
-                            items = data["items"]
-                            logger.info(f"Found {len(items)} items in response")
-                            if len(items) == 0:
-                                logger.info("Smart search returned empty items array")
-                                return []
-                            
-                            # Log first item structure for debugging
-                            if items and len(items) > 0:
-                                first_item = items[0]
-                                logger.info(f"First item type: {type(first_item)}, keys: {list(first_item.keys()) if isinstance(first_item, dict) else 'not a dict'}")
-                            
-                            # Ensure items are valid assets with id field
-                            valid_items = []
-                            for item in items:
-                                if isinstance(item, dict):
-                                    # Check for id in various possible locations
-                                    asset_id = item.get("id") or item.get("assetId")
-                                    if not asset_id:
-                                        logger.warning(f"Item missing id field, keys: {list(item.keys())}")
-                                        continue
-                                    
-                                    # If filtering by dimensions (for screenshots), check dimensions
-                                    if filter_by_dimensions and query.lower() == "screenshot":
-                                        exif = item.get("exifInfo", {}) or {}
-                                        width = exif.get("exifImageWidth")
-                                        height = exif.get("exifImageHeight")
-                                        
-                                        if width and height:
-                                            if self._is_screenshot_dimension(width, height):
-                                                valid_items.append(item)
-                                                logger.info(f"Found screenshot match: {width}x{height}")
-                                            else:
-                                                logger.debug(f"Skipping non-screenshot dimensions: {width}x{height}")
-                                        else:
-                                            # If no EXIF, include it anyway (might be a screenshot)
-                                            valid_items.append(item)
-                                    else:
-                                        # No dimension filtering, include all valid items
-                                        valid_items.append(item)
-                                    
-                                    # Stop when we have enough
-                                    if len(valid_items) >= limit:
-                                        break
-                                else:
-                                    logger.warning(f"Item is not a dict: {type(item)}")
-                            
-                            if valid_items:
-                                logger.info(f"Returning {len(valid_items)} valid assets from smart search (filtered from {len(items)} items)")
-                                return valid_items[:limit]
-                            else:
-                                logger.warning("No valid assets found in items array")
-                        elif "id" in data:
-                            # Single asset returned as dict
-                            logger.info("Single asset returned from smart search")
-                            return [data]
-                        elif "count" in data:
-                            count = data.get("count", 0)
-                            logger.info(f"Smart search returned count: {count}")
-                            if count == 0:
-                                return []
-                    
-                    if isinstance(data, list):
-                        # Direct list of assets
-                        valid_items = [item for item in data[:limit] if isinstance(item, dict) and "id" in item]
-                        if valid_items:
-                            logger.info(f"Returning {len(valid_items)} valid assets from list response")
-                            return valid_items
-                    
-                    # If we got here, the response format is unexpected
-                    logger.warning(f"Smart search returned unexpected format: {data}")
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(f"Smart search failed for {search_url}: {e}")
-                    continue
-            
-            # If all attempts failed, log and fall back
-            if last_error:
-                logger.error(f"Smart search failed with error: {last_error}")
-            else:
-                logger.warning(f"Smart search returned unexpected format, falling back to random")
-            return await self.get_unreviewed(limit=limit)
+            r = await self._request_with_retry("POST", f"{self.base}/search/smart", max_retries=2, json=body)
+            data = r.json()
+
+            if isinstance(data, dict) and "items" in data:
+                items = data["items"]
+                if not items:
+                    return []
+
+                valid_items: list[dict[str, Any]] = []
+                for item in items:
+                    if not isinstance(item, dict) or not (item.get("id") or item.get("assetId")):
+                        continue
+
+                    if filter_by_dimensions and query.lower() == "screenshot":
+                        exif = item.get("exifInfo", {}) or {}
+                        width = exif.get("exifImageWidth")
+                        height = exif.get("exifImageHeight")
+                        if width and height and not self._is_screenshot_dimension(width, height):
+                            continue
+
+                    valid_items.append(item)
+                    if len(valid_items) >= limit:
+                        break
+
+                return valid_items[:limit]
+
+            if isinstance(data, dict) and "id" in data:
+                return [data]
+
+            if isinstance(data, list):
+                return [item for item in data[:limit] if isinstance(item, dict) and "id" in item]
+
+            return []
         except Exception as e:
-            logger.error(f"Smart search error: {e}", exc_info=True)
-            # If smart search fails, fall back to random
-            # This handles cases where smart search isn't available or query fails
-            return await self.get_unreviewed(limit=limit)
+            logger.warning(f"Smart search failed: {e}")
+            return []
