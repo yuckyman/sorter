@@ -206,41 +206,43 @@ async def root():
         }
         
         .wrap {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
             display: flex;
             flex-direction: column;
             height: 100vh;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 12px 16px;
             overflow: hidden;
         }
         
         .header {
             border-bottom: 1px solid var(--border);
-            padding-bottom: 12px;
-            margin-bottom: 20px;
+            padding-bottom: 10px;
+            margin-bottom: 10px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
             flex-shrink: 0;
+            min-height: 0;
         }
         
-        .title { color: var(--jade); }
+        .title { color: var(--jade); white-space: nowrap; }
         .title span { color: var(--text-dim); }
         
         .main {
             display: grid;
             grid-template-columns: 1fr 220px;
-            gap: 20px;
-            margin-bottom: 15px;
+            gap: 12px;
             flex: 1;
             min-height: 0;
+            overflow: hidden;
         }
         
         .frame {
             position: relative;
             border: 1px solid var(--border);
-            height: 100%;
             min-height: 0;
             display: flex;
             align-items: center;
@@ -256,9 +258,10 @@ async def root():
         }
         
         #photo, #video {
-            width: 100%;
+            max-width: 100%;
+            max-height: 100%;
+            width: auto;
             height: auto;
-            max-height: 65vh;
             object-fit: contain;
         }
         
@@ -267,8 +270,10 @@ async def root():
         .sidebar {
             border: 1px solid var(--border);
             background: var(--bg-light);
-            padding: 15px;
+            padding: 12px;
             font-size: 11px;
+            min-height: 0;
+            overflow-y: auto;
         }
         
         .sidebar h3 {
@@ -307,10 +312,9 @@ async def root():
             display: flex;
             justify-content: center;
             gap: 40px;
-            padding: 15px 0;
+            padding: 10px 0;
             border-top: 1px solid var(--border);
-            border-bottom: 1px solid var(--border);
-            margin-bottom: 12px;
+            flex-shrink: 0;
         }
         
         .ctrl {
@@ -329,7 +333,8 @@ async def root():
         .status-bar {
             color: var(--text-dim);
             font-size: 11px;
-            min-height: 16px;
+            min-height: 14px;
+            flex-shrink: 0;
             transition: opacity 0.3s ease;
         }
         
@@ -348,11 +353,13 @@ async def root():
         }
         
         .history {
-            margin-top: 10px;
             border: 1px solid var(--border);
             background: var(--bg-light);
-            padding: 12px;
+            padding: 8px 12px;
             font-size: 11px;
+            flex-shrink: 0;
+            max-height: 100px;
+            overflow-y: auto;
         }
         
         .history h3 {
@@ -388,48 +395,49 @@ async def root():
         
         @media (max-width: 768px) {
             .wrap {
-                padding: 12px 12px 24px;
+                padding: 8px 10px;
             }
             
             .header {
                 flex-direction: column;
                 align-items: flex-start;
-                gap: 6px;
+                gap: 4px;
+            }
+            
+            .header-controls {
+                flex-wrap: wrap;
+                gap: 8px;
             }
             
             .main {
-                display: block;
+                grid-template-columns: 1fr;
+                grid-template-rows: 1fr auto;
             }
             
             .frame {
-                min-height: 60vh;
-                margin-bottom: 18px;
+                min-height: 0;
             }
             
             .sidebar {
-                margin-top: 18px;
+                max-height: 80px;
+                overflow-y: auto;
             }
             
             .controls {
-                flex-wrap: wrap;
-                gap: 16px;
-                position: sticky;
-                bottom: 0;
-                background: var(--bg-light);
-                padding: 18px 12px;
-                z-index: 5;
+                gap: 12px;
+                padding: 8px 0;
             }
             
             .ctrl {
-                flex: 1 1 calc(50% - 16px);
+                flex: 1 1 calc(50% - 8px);
                 border: 1px solid var(--border);
-                padding: 12px 0;
+                padding: 8px 0;
                 text-align: center;
                 border-radius: 4px;
             }
             
-            #photo, #video {
-                max-height: calc(100vh - 220px);
+            .history {
+                max-height: 60px;
             }
         }
         
@@ -449,8 +457,8 @@ async def root():
             font-size: 11px;
             display: flex;
             flex-direction: column;
-            gap: 6px;
-            min-width: 180px;
+            gap: 4px;
+            min-width: 140px;
         }
 
         .stats-title {
@@ -510,8 +518,9 @@ async def root():
         
         .header-controls {
             display: flex;
-            gap: 20px;
+            gap: 12px;
             align-items: center;
+            flex-wrap: wrap;
         }
         
         .camera-filter {
@@ -532,11 +541,11 @@ async def root():
             color: var(--text);
             font-family: inherit;
             font-size: 11px;
-            padding: 4px 8px;
-            min-width: 200px;
-            max-width: 300px;
+            padding: 3px 6px;
+            min-width: 160px;
+            max-width: 240px;
             cursor: pointer;
-            max-height: 120px;
+            max-height: 80px;
         }
         
         .camera-filter select:focus {
@@ -573,9 +582,9 @@ async def root():
             color: var(--text);
             font-family: inherit;
             font-size: 11px;
-            padding: 4px 8px;
-            min-width: 150px;
-            max-width: 200px;
+            padding: 3px 6px;
+            min-width: 120px;
+            max-width: 160px;
             cursor: pointer;
         }
         
