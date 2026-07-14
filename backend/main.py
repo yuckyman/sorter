@@ -15,6 +15,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+env_path = Path(__file__).parent.parent / ".env.local"
+load_dotenv(env_path)
+
+sys.path.insert(0, str(Path(__file__).parent))
 from models import (
     ActionLiteral,
     ActionResponse,
@@ -26,11 +30,6 @@ from models import (
     default_action_counts,
     default_stats_state,
 )
-
-env_path = Path(__file__).parent.parent / ".env.local"
-load_dotenv(env_path)
-
-sys.path.insert(0, str(Path(__file__).parent))
 from immich_client import ImmichClient
 from state_store import StateStore
 
