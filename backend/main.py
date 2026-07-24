@@ -1474,7 +1474,7 @@ def _format_asset(asset: AssetInput) -> AssetFormatted:
         "mime_type": mime_type,
         "thumb_url": thumb_direct,
         "image_url": display_url,
-        "video_url": f"/proxy/{asset_id}/original" if asset.get("type") == "VIDEO" else None,
+        "video_url": f"/proxy/{asset_id}/playback" if asset.get("type") == "VIDEO" else None,
         "meta": {
             "filename": asset.get("originalFileName", "--"),
             "date": asset.get("fileCreatedAt", "")[:10] if asset.get("fileCreatedAt") else "--",
@@ -1629,7 +1629,10 @@ async def proxy_image(asset_id: str, size: str, request: Request):
 
     for try_size in sizes_to_try:
         base = immich.root if try_size in ("thumbnail", "preview", "fullsize") else immich.base
-        upstream_url = f"{base}/assets/{asset_id}/{try_size}"
+        if try_size == "playback":
+            upstream_url = f"{immich.base}/assets/{asset_id}/video/playback"
+        else:
+            upstream_url = f"{base}/assets/{asset_id}/{try_size}"
         request_headers = {}
         range_header = request.headers.get("range")
         if range_header:
