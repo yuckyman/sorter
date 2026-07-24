@@ -696,7 +696,7 @@ async def root():
         <div class="main">
             <div class="frame loading" id="frame">
                 <div class="empty" id="empty" style="display:none;">-- queue empty --</div>
-                <img id="photo" style="display:none;" onerror="this.onerror=null;this.src='/proxy/'+currentId+'/preview'" />
+                <img id="photo" style="display:none;" onerror="this.onerror=null;this.style.display='none'" />
                 <video id="video" style="display:none;" controls muted></video>
             </div>
             
@@ -1462,7 +1462,7 @@ def _format_asset(asset: AssetInput) -> AssetFormatted:
     is_image = asset.get("type", "IMAGE") == "IMAGE"
     is_web_compatible = mime_type in WEB_COMPATIBLE_MIMES if is_image else False
 
-    thumb_direct = f"{immich.root}/assets/{asset_id}/thumbnail?size=preview&apiKey={IMMICH_API_KEY}"
+    thumb_direct = f"/proxy/{asset_id}/preview"
     if is_image and not is_web_compatible:
         display_url = f"/proxy/{asset_id}/fullsize"
     else:
