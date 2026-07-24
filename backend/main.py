@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 import sys
 import os
+import time
 import httpx
 import asyncio
 import logging
@@ -87,7 +88,8 @@ db_file = Path(__file__).parent.parent / "sorter.db"
 state_store = StateStore(db_file)
 stats_lock = asyncio.Lock()
 feed_lock = asyncio.Lock()
-COOLDOWN_DAYS = int(os.getenv("SORTER_SEEN_COOLDOWN_DAYS", "30"))
+COOLDOWN_DAYS = int(os.getenv("SORTER_SEEN_COOLDOWN_DAYS", "0"))
+DEBUG = os.getenv("SORTER_DEBUG", "").lower() in ("1", "true", "yes")
 
 def _normalize_state(data: Any) -> StatsState:
     if not isinstance(data, dict):
@@ -344,6 +346,21 @@ async def root():
         .status-bar.fading {
             animation: statusFade 1.2s steps(8, end) forwards;
         }
+
+        .debug-panel {
+            background: var(--bg-light);
+            border: 1px solid var(--border);
+            padding: 6px 10px;
+            font-size: 10px;
+            color: var(--text-dim);
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+            flex-shrink: 0;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+        .debug-panel .t-ok { color: var(--jade); }
+        .debug-panel .t-warn { color: #9a8a5a; }
+        .debug-panel .t-slow { color: #8a5a5a; }
         
         @keyframes statusFade {
             0% { opacity: 1; }
@@ -629,6 +646,7 @@ async def root():
                     </select>
                 </div>
                 <div class="queue-ct" id="queueInfo">queue: 0</div>
+                <div class="queue-ct" id="seenInfo"></div>
                 <div class="stats-panel" id="statsLifetime">
                     <div class="stats-title">session <span id="sessionId">0</span></div>
                     <div class="stats-row">
@@ -654,7 +672,7 @@ async def root():
         <div class="main">
             <div class="frame loading" id="frame">
                 <div class="empty" id="empty" style="display:none;">-- queue empty --</div>
-                <img id="photo" style="display:none;" />
+                <img id="photo" style="display:none;" onerror="this.onerror=null;this.src='/proxy/'+currentId+'/thumbnail'" />
                 <video id="video" style="display:none;" controls muted></video>
             </div>
             
@@ -683,6 +701,7 @@ async def root():
         </div>
         
         <div class="status-bar" id="status"></div>
+        <div class="debug-panel" id="debugPanel" style="display:none;"></div>
         
         <div class="history">
             <h3>history</h3>
@@ -699,7 +718,6 @@ async def root():
         const TARGET_QUEUE_SIZE = 35;
         const QUEUE_REFILL_BATCH = 5;
         const QUEUE_REFILL_DELAY_MS = 1000;
-        const THUMB_PRELOAD_LIMIT = 20;
         const QUEUE_REFILL_ERROR_DELAY_MS = 1800;
         const FULL_RES_PRELOAD_LIMIT = 1;
         let isPreloading = false;
@@ -845,6 +863,10 @@ async def root():
             document.getElementById('statLifetimeFav').textContent = stats.lifetime.fav || 0;
             document.getElementById('statLifetimeArchive').textContent = stats.lifetime.archive || 0;
 
+            if (stats.seen_count != null) {
+                document.getElementById('seenInfo').textContent = `seen: ${stats.seen_count}`;
+            }
+
             renderLifetimeHeatmap();
         }
 
@@ -927,7 +949,7 @@ async def root():
             
             let typeText = asset.type || 'IMAGE';
             if (asset.type === 'VIDEO' && asset.duration) {
-                let dur = asset.duration;
+                let dur = String(asset.duration);
                 if (dur.includes(':')) {
                     const parts = dur.split(':');
                     if (parts.length === 3) {
@@ -935,6 +957,11 @@ async def root():
                         const secs = Math.floor(parseFloat(parts[2]) || 0);
                         dur = `${mins}:${secs.toString().padStart(2, '0')}`;
                     }
+                } else {
+                    const totalSecs = Math.floor(parseFloat(dur) || 0);
+                    const mins = Math.floor(totalSecs / 60);
+                    const secs = totalSecs % 60;
+                    dur = `${mins}:${secs.toString().padStart(2, '0')}`;
                 }
                 typeText = `VIDEO ${dur}`;
             }
@@ -943,6 +970,18 @@ async def root():
             document.getElementById('queueInfo').textContent = `queue: ${imageQueue.length}`;
         }
         
+        const PREFETCH_COUNT = 5;
+
+        function prefetchNextThumbs() {
+            for (let i = 0; i < Math.min(PREFETCH_COUNT, imageQueue.length); i++) {
+                const a = imageQueue[i];
+                if (a && a.thumb_url) {
+                    const img = new Image();
+                    img.src = a.thumb_url;
+                }
+            }
+        }
+
         function displayImage(asset) {
             const photo = document.getElementById('photo');
             const video = document.getElementById('video');
@@ -980,6 +1019,8 @@ async def root():
                     })
                     .catch(() => console.warn('Failed to load full res'));
             }
+
+            prefetchNextThumbs();
         }
         
         async function loadCameras() {
@@ -1065,6 +1106,7 @@ async def root():
                 const url = buildNextUrl(needed);
                 const r = await fetch(url);
                 const data = await r.json();
+                showDebug(data._timings);
                 
                 if (data.error) {
                     showStatus(`Preload error: ${data.error}`, 'error');
@@ -1084,11 +1126,6 @@ async def root():
                     }
                     queuedAssetIds.add(asset.id);
                     added += 1;
-                    
-                    if (imageQueue.length < THUMB_PRELOAD_LIMIT) {
-                        const thumbImg = new Image();
-                        thumbImg.src = asset.thumb_url;
-                    }
                     
                     if (asset.type !== 'VIDEO' && imageQueue.length <= FULL_RES_PRELOAD_LIMIT) {
                         if (!preloadedFullRes.has(asset.id)) {
@@ -1148,6 +1185,7 @@ async def root():
                 const url = buildNextUrl(neededNow);
                 const r = await fetch(url);
                 const data = await r.json();
+                showDebug(data._timings);
                 
                 if (data.error) {
                     showStatus(`Error: ${data.error}`, 'error');
@@ -1178,10 +1216,6 @@ async def root():
                 for (const asset of rest) {
                     if (!asset || !asset.id || queuedAssetIds.has(asset.id) || currentId === asset.id) continue;
                     queuedAssetIds.add(asset.id);
-                    if (imageQueue.length < THUMB_PRELOAD_LIMIT) {
-                        const thumbImg = new Image();
-                        thumbImg.src = asset.thumb_url;
-                    }
                     imageQueue.push(asset);
                 }
 
@@ -1327,6 +1361,24 @@ async def root():
         fetchStats();
         
         setTimeout(() => loadCameras(), 100);
+
+        const URL_DEBUG = new URLSearchParams(window.location.search).has('debug');
+        const debugPanel = document.getElementById('debugPanel');
+        let debugLog = [];
+
+        function showDebug(timings) {
+            if (!URL_DEBUG || !timings) return;
+            debugPanel.style.display = 'block';
+            const lines = [];
+            for (const [k, v] of Object.entries(timings)) {
+                if (k.startsWith('_')) continue;
+                const cls = v > 2000 ? 't-slow' : v > 500 ? 't-warn' : 't-ok';
+                lines.push(`<span class="${cls}">${k}: ${v}ms</span>`);
+            }
+            debugLog.unshift(lines.join('  '));
+            if (debugLog.length > 8) debugLog.length = 8;
+            debugPanel.innerHTML = debugLog.join('<br>');
+        }
     </script>
 </body>
 </html>
@@ -1352,7 +1404,9 @@ async def get_cameras():
 
 @app.get("/stats")
 async def get_stats():
-    return await read_stats()
+    stats = await read_stats()
+    stats["seen_count"] = state_store.count_seen()
+    return stats
 
 def _feed_key(cameras: str | None = None, smart_query: str | None = None) -> str:
     if smart_query:
@@ -1370,13 +1424,15 @@ def _format_asset(asset: AssetInput) -> AssetFormatted:
         logger.error(f"Asset missing 'id' field. Available keys: {list(asset.keys())}")
         raise ValueError(f"Asset missing 'id' field. Available keys: {list(asset.keys())}")
     exif: ExifInfo = asset.get("exifInfo", {}) or {}  # type: ignore[assignment]
+    asset_id = asset["id"]
+    thumb_direct = f"{immich.root}/assets/{asset_id}/thumbnail?size=thumbnail&apiKey={IMMICH_API_KEY}"
     return {
-        "id": asset["id"],
+        "id": asset_id,
         "type": asset.get("type", "IMAGE"),
         "duration": asset.get("duration", "0:00:00.00000"),
-        "thumb_url": f"/proxy/{asset['id']}/thumbnail",
-        "image_url": f"/proxy/{asset['id']}/original",
-        "video_url": f"/proxy/{asset['id']}/original" if asset.get("type") == "VIDEO" else None,
+        "thumb_url": thumb_direct,
+        "image_url": f"/proxy/{asset_id}/original",
+        "video_url": f"/proxy/{asset_id}/original" if asset.get("type") == "VIDEO" else None,
         "meta": {
             "filename": asset.get("originalFileName", "--"),
             "date": asset.get("fileCreatedAt", "")[:10] if asset.get("fileCreatedAt") else "--",
@@ -1395,6 +1451,8 @@ def _format_asset(asset: AssetInput) -> AssetFormatted:
 
 @app.get("/next")
 async def next_image(count: int = 1, cameras: str | None = None, smart_query: str | None = None):
+    t0 = time.monotonic()
+    timings: dict[str, float] = {}
     try:
         requested = max(1, min(int(count), 24))
         camera_list = [c.strip() for c in cameras.split(",") if c.strip()] if cameras else []
@@ -1407,13 +1465,17 @@ async def next_image(count: int = 1, cameras: str | None = None, smart_query: st
                 logger.info(f"Fetching {requested} asset(s) using smart search feed '{feed_key}'")
                 filter_by_dims = smart_query.lower() == "screenshot"
                 fetch_size = max(requested * 4, 24)
+                t1 = time.monotonic()
                 candidates = await immich.search_smart(
                     query=smart_query,
                     limit=fetch_size,
                     filter_by_dimensions=filter_by_dims,
                 )
+                timings["immich_search"] = time.monotonic() - t1
+                t2 = time.monotonic()
                 candidate_ids = [asset.get("id") for asset in candidates if isinstance(asset, dict) and asset.get("id")]
                 unseen_ids = set(state_store.filter_unseen(candidate_ids, COOLDOWN_DAYS))
+                timings["filter_unseen"] = time.monotonic() - t2
                 random.shuffle(candidates)
                 for asset in candidates:
                     asset_id = asset.get("id")
@@ -1423,51 +1485,57 @@ async def next_image(count: int = 1, cameras: str | None = None, smart_query: st
                     if len(selected_assets) >= requested:
                         break
             else:
-                start_page = state_store.get_feed_cursor(feed_key)
-                page = start_page
-                max_page_fetches = 12
-                target_pool = max(requested * 3, 24)
-                candidate_pool = []
+                # Random search: fetch batches, filter unseen, repeat until enough found
+                batch_size = max(requested * 4, 20)
+                max_rounds = 6
+                seen_in_request: set[str] = set()
+                all_candidates: list[dict[str, Any]] = []
+                random_times: list[float] = []
 
-                for _ in range(max_page_fetches):
+                for round_i in range(max_rounds):
+                    tr = time.monotonic()
                     try:
-                        page_assets = await immich.get_assets_page(
-                            page=page,
-                            size=100,
-                            camera_models=camera_list or None,
-                        )
+                        if camera_list:
+                            batch = await immich.get_unreviewed_filtered(
+                                limit=batch_size, camera_models=camera_list
+                            )
+                        else:
+                            batch = await immich.get_unreviewed(limit=batch_size)
                     except Exception as exc:
-                        logger.warning(f"Deterministic paging failed for '{feed_key}' on page {page}: {exc}")
-                        page_assets = []
-                    page += 1
-                    if not page_assets:
-                        continue
-                    candidate_pool.extend(page_assets)
-                    if len(candidate_pool) >= target_pool:
+                        logger.warning(f"Random search round {round_i} failed: {exc}")
                         break
+                    random_times.append(time.monotonic() - tr)
 
-                state_store.set_feed_cursor(feed_key, page)
+                    for asset in batch:
+                        aid = asset.get("id") if isinstance(asset, dict) else None
+                        if aid and aid not in seen_in_request:
+                            seen_in_request.add(aid)
+                            all_candidates.append(asset)
 
-                if not candidate_pool:
-                    fallback_limit = max(requested * 2, 12)
-                    if camera_list:
-                        candidate_pool = await immich.get_unreviewed_filtered(limit=fallback_limit, camera_models=camera_list)
-                    else:
-                        candidate_pool = await immich.get_unreviewed(limit=fallback_limit)
+                    t4 = time.monotonic()
+                    candidate_ids = [a.get("id") for a in all_candidates if isinstance(a, dict) and a.get("id")]
+                    unseen_ids = set(state_store.filter_unseen(candidate_ids, COOLDOWN_DAYS))
+                    timings["filter_unseen"] = time.monotonic() - t4
 
-                candidate_ids = [asset.get("id") for asset in candidate_pool if isinstance(asset, dict) and asset.get("id")]
-                unseen_ids = set(state_store.filter_unseen(candidate_ids, COOLDOWN_DAYS))
-                random.shuffle(candidate_pool)
-                for asset in candidate_pool:
-                    asset_id = asset.get("id")
-                    if asset_id in unseen_ids and asset_id not in selected_ids:
-                        selected_assets.append(asset)
-                        selected_ids.add(asset_id)
+                    for asset in all_candidates:
+                        asset_id = asset.get("id")
+                        if asset_id in unseen_ids and asset_id not in selected_ids:
+                            selected_assets.append(asset)
+                            selected_ids.add(asset_id)
+                        if len(selected_assets) >= requested:
+                            break
+
                     if len(selected_assets) >= requested:
                         break
 
+                timings["random_search"] = sum(random_times)
+                timings["random_rounds"] = len(random_times)
+                timings["random_pool_size"] = len(all_candidates)
+
             if selected_assets:
                 state_store.mark_seen([asset["id"] for asset in selected_assets if isinstance(asset, dict) and asset.get("id")])
+
+        timings["total"] = time.monotonic() - t0
 
         if not selected_assets:
             logger.info("No more assets available")
@@ -1475,12 +1543,27 @@ async def next_image(count: int = 1, cameras: str | None = None, smart_query: st
 
         formatted_assets = [_format_asset(asset) for asset in selected_assets]
         asset_types = [a["type"] for a in formatted_assets]
-        logger.info(f"Returning {len(formatted_assets)} asset(s): {asset_types}")
-        
+        log_msg = f"Returning {len(formatted_assets)} asset(s): {asset_types}"
+        if DEBUG:
+            timing_str = " | ".join(
+                f"{k}={v*1000:.0f}ms" if isinstance(v, float) else f"{k}={v}"
+                for k, v in timings.items()
+            )
+            log_msg += f" [{timing_str}]"
+        logger.info(log_msg)
+
+        result: dict[str, Any]
         if requested == 1:
-            return formatted_assets[0]
+            result = formatted_assets[0]
         else:
-            return {"assets": formatted_assets}
+            result = {"assets": formatted_assets}
+
+        if DEBUG:
+            result["_timings"] = {k: round(v * 1000, 1) if isinstance(v, float) else v for k, v in timings.items()}
+
+        result["seen_count"] = state_store.count_seen()
+
+        return result
     except Exception as e:
         logger.error(f"Error fetching assets: {e}", exc_info=True)
         return {"error": str(e), "type": type(e).__name__}
@@ -1488,7 +1571,8 @@ async def next_image(count: int = 1, cameras: str | None = None, smart_query: st
 @app.get("/proxy/{asset_id}/{size}")
 async def proxy_image(asset_id: str, size: str, request: Request):
     logger.debug(f"Proxying {size} for asset {asset_id}")
-    upstream_url = f"{immich.base}/assets/{asset_id}/{size}"
+    base = immich.root if size in ("thumbnail", "preview") else immich.base
+    upstream_url = f"{base}/assets/{asset_id}/{size}"
     request_headers = {}
     range_header = request.headers.get("range")
     if range_header:

@@ -12,11 +12,12 @@ from models import AssetInput
 class ImmichClient:
     def __init__(self, base_url: str, api_key: str) -> None:
         self.base = base_url.rstrip("/")
+        self.root = self.base.removesuffix("/api") if self.base.endswith("/api") else self.base
         self.headers = {"x-api-key": api_key}
         self.client = httpx.AsyncClient(
             headers=self.headers,
             timeout=httpx.Timeout(30.0, connect=10.0),
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
         )
         self._camera_cache: list[str] | None = None
         # Separate lanes so proxy streaming does not starve metadata requests.
@@ -101,6 +102,10 @@ class ImmichClient:
                 value = data.get(key)
                 if isinstance(value, list):
                     return [item for item in value if isinstance(item, dict) and item.get("id")]
+                if isinstance(value, dict):
+                    inner = value.get("items")
+                    if isinstance(inner, list):
+                        return [item for item in inner if isinstance(item, dict) and item.get("id")]
             if data.get("id"):
                 return [data]
         return []
@@ -160,41 +165,23 @@ class ImmichClient:
         return []
 
     async def get_unreviewed(self, limit: int = 1) -> list[dict[str, Any]]:
-        if limit == 1:
-            return await self._search_random(size=1)
-
         assets: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
-        max_attempts = limit * 3
-        attempts = 0
+        max_attempts = 3
+        batch_size = max(limit * 2, 10)
 
-        async def fetch_one() -> dict[str, Any] | None:
+        for _ in range(max_attempts):
             try:
-                results = await self._search_random(size=1)
-                return results[0] if results else None
+                batch = await self._search_random(size=batch_size)
             except Exception:
-                return None
-
-        pending: set[asyncio.Task[dict[str, Any] | None]] = set()
-        while len(assets) < limit and attempts < max_attempts:
-            while len(pending) < 6 and attempts < max_attempts:
-                pending.add(asyncio.create_task(fetch_one()))
-                attempts += 1
-
-            if not pending:
+                continue
+            for item in batch:
+                aid = item.get("id")
+                if aid and aid not in seen_ids:
+                    seen_ids.add(aid)
+                    assets.append(item)
+            if len(assets) >= limit:
                 break
-
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                asset = await task
-                if asset and asset.get("id") not in seen_ids:
-                    seen_ids.add(asset["id"])
-                    assets.append(asset)
-                    if len(assets) >= limit:
-                        for t in pending:
-                            t.cancel()
-                        pending.clear()
-                        break
 
         return assets[:limit]
 
@@ -268,42 +255,26 @@ class ImmichClient:
         camera_set = set(camera_models)
         matching_assets: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
-        max_attempts = limit * 10
-        attempts = 0
+        max_attempts = 3
+        batch_size = max(limit * 5, 20)
 
-        async def fetch_and_filter() -> dict[str, Any] | None:
+        for _ in range(max_attempts):
             try:
-                camera = next(iter(camera_set))
-                results = await self._search_random(size=1, model=camera)
-                asset = results[0] if results else None
-                if asset and asset.get("id") not in seen_ids:
-                    seen_ids.add(asset.get("id"))
-                    camera = (asset.get("exifInfo", {}) or {}).get("model") or "--"
-                    if camera in camera_set:
-                        return asset
-            except Exception:
-                pass
-            return None
-
-        pending: set[asyncio.Task[dict[str, Any] | None]] = set()
-        while len(matching_assets) < limit and attempts < max_attempts:
-            while len(pending) < 6 and attempts < max_attempts:
-                pending.add(asyncio.create_task(fetch_and_filter()))
-                attempts += 1
-
-            if not pending:
-                break
-
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                asset = await task
-                if asset:
-                    matching_assets.append(asset)
+                for model in camera_set:
+                    batch = await self._search_random(size=batch_size, model=model)
+                    for item in batch:
+                        aid = item.get("id")
+                        if aid and aid not in seen_ids:
+                            seen_ids.add(aid)
+                            camera = (item.get("exifInfo", {}) or {}).get("model") or "--"
+                            if camera in camera_set:
+                                matching_assets.append(item)
                     if len(matching_assets) >= limit:
-                        for t in pending:
-                            t.cancel()
-                        pending.clear()
                         break
+            except Exception:
+                continue
+            if len(matching_assets) >= limit:
+                break
 
         return matching_assets[:limit]
 

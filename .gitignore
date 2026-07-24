@@ -32,7 +32,11 @@ logs/
 
 # Python artifacts
 venv/
+.venv/
 __pycache__/
 sorter.db
 sorter.db-shm
 sorter.db-wal
+
+# Documentation
+docs/

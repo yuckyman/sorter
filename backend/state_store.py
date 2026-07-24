@@ -136,3 +136,8 @@ class StateStore:
     def clear_seen(self) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM seen_assets")
+
+    def count_seen(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM seen_assets").fetchone()
+        return row["c"] if row else 0
