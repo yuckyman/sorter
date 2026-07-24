@@ -73,6 +73,7 @@ class AssetInput(TypedDict, total=False):
     type: str
     duration: str
     originalFileName: str
+    originalMimeType: str
     fileCreatedAt: str
     exifInfo: ExifInfo
 
@@ -97,6 +98,7 @@ class AssetFormatted(TypedDict):
     id: str
     type: str
     duration: str
+    mime_type: str
     thumb_url: str
     image_url: str
     video_url: str | None

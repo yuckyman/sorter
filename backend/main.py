@@ -672,7 +672,7 @@ async def root():
         <div class="main">
             <div class="frame loading" id="frame">
                 <div class="empty" id="empty" style="display:none;">-- queue empty --</div>
-                <img id="photo" style="display:none;" onerror="this.onerror=null;this.src='/proxy/'+currentId+'/thumbnail'" />
+                <img id="photo" style="display:none;" onerror="this.onerror=null;this.src='/proxy/'+currentId+'/preview'" />
                 <video id="video" style="display:none;" controls muted></video>
             </div>
             
@@ -1001,7 +1001,7 @@ async def root():
             updateMeta(asset);
             
             if (asset.type === 'VIDEO') {
-                video.poster = asset.thumb_url;
+                video.poster = '/proxy/' + asset.id + '/preview';
                 video.src = asset.video_url || asset.image_url;
                 video.style.display = 'block';
                 video.load();
@@ -1017,7 +1017,7 @@ async def root():
                             photo.style.opacity = '1';
                         }
                     })
-                    .catch(() => console.warn('Failed to load full res'));
+                    .catch(() => { photo.style.opacity = '1'; });
             }
 
             prefetchNextThumbs();
@@ -1416,6 +1416,11 @@ def _feed_key(cameras: str | None = None, smart_query: str | None = None) -> str
         return f"camera:{normalized}" if normalized else "all"
     return "all"
 
+WEB_COMPATIBLE_MIMES = frozenset({
+    "image/avif", "image/bmp", "image/gif", "image/jpeg",
+    "image/png", "image/apng", "image/webp",
+})
+
 def _format_asset(asset: AssetInput) -> AssetFormatted:
     if not asset or not isinstance(asset, dict):
         logger.error(f"Invalid asset format: {type(asset)}, value: {asset}")
@@ -1425,13 +1430,22 @@ def _format_asset(asset: AssetInput) -> AssetFormatted:
         raise ValueError(f"Asset missing 'id' field. Available keys: {list(asset.keys())}")
     exif: ExifInfo = asset.get("exifInfo", {}) or {}  # type: ignore[assignment]
     asset_id = asset["id"]
-    thumb_direct = f"{immich.root}/assets/{asset_id}/thumbnail?size=thumbnail&apiKey={IMMICH_API_KEY}"
+    mime_type = asset.get("originalMimeType") or ""
+    is_image = asset.get("type", "IMAGE") == "IMAGE"
+    is_web_compatible = mime_type in WEB_COMPATIBLE_MIMES if is_image else False
+
+    thumb_direct = f"{immich.root}/assets/{asset_id}/thumbnail?size=preview&apiKey={IMMICH_API_KEY}"
+    if is_image and not is_web_compatible:
+        display_url = f"/proxy/{asset_id}/fullsize"
+    else:
+        display_url = f"/proxy/{asset_id}/original"
     return {
         "id": asset_id,
         "type": asset.get("type", "IMAGE"),
         "duration": asset.get("duration", "0:00:00.00000"),
+        "mime_type": mime_type,
         "thumb_url": thumb_direct,
-        "image_url": f"/proxy/{asset_id}/original",
+        "image_url": display_url,
         "video_url": f"/proxy/{asset_id}/original" if asset.get("type") == "VIDEO" else None,
         "meta": {
             "filename": asset.get("originalFileName", "--"),
@@ -1571,74 +1585,91 @@ async def next_image(count: int = 1, cameras: str | None = None, smart_query: st
 @app.get("/proxy/{asset_id}/{size}")
 async def proxy_image(asset_id: str, size: str, request: Request):
     logger.debug(f"Proxying {size} for asset {asset_id}")
-    base = immich.root if size in ("thumbnail", "preview") else immich.base
-    upstream_url = f"{base}/assets/{asset_id}/{size}"
-    request_headers = {}
-    range_header = request.headers.get("range")
-    if range_header:
-        request_headers["range"] = range_header
 
-    TRANSPARENT_1X1_PNG = (
+    PLACEHOLDER_PNG = (
         b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01'
-        b'\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89'
-        b'\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01'
-        b'\r\n\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+        b'\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00'
+        b'\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00'
+        b'\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82'
     )
 
-    stream_context = None
-    try:
-        stream_context = immich.stream_with_retry(
-            upstream_url,
-            max_retries=1,
-            headers=request_headers or None,
-            media=True,
-        )
-        upstream = await stream_context.__aenter__()
+    FALLBACK_CHAIN = {
+        "thumbnail": ["preview", "fullsize"],
+        "preview": ["fullsize"],
+    }
+    sizes_to_try = [size] + FALLBACK_CHAIN.get(size, [])
 
-        content_type = upstream.headers.get("content-type", "application/octet-stream")
-        if size == "original" and "video" not in content_type.lower() and not content_type.startswith("image/"):
-            content_type = "video/mp4"
+    for try_size in sizes_to_try:
+        base = immich.root if try_size in ("thumbnail", "preview", "fullsize") else immich.base
+        upstream_url = f"{base}/assets/{asset_id}/{try_size}"
+        request_headers = {}
+        range_header = request.headers.get("range")
+        if range_header:
+            request_headers["range"] = range_header
 
-        response_headers = {}
-        passthrough_headers = ("accept-ranges", "content-range", "content-length", "etag", "last-modified", "cache-control")
-        for key in passthrough_headers:
-            value = upstream.headers.get(key)
-            if value:
-                response_headers[key] = value
-
-        async def stream_body():
-            try:
-                async for chunk in upstream.aiter_bytes():
-                    if chunk:
-                        yield chunk
-            finally:
-                if stream_context is not None:
-                    await stream_context.__aexit__(None, None, None)
-
-        logger.debug(f"Streaming {size} for {asset_id}: {content_type}")
-        return StreamingResponse(
-            stream_body(),
-            status_code=upstream.status_code,
-            media_type=content_type,
-            headers=response_headers,
-        )
-    except httpx.HTTPStatusError as e:
-        if stream_context is not None:
-            await stream_context.__aexit__(type(e), e, e.__traceback__)
-        if e.response.status_code == 404 and size in ("thumbnail", "preview"):
-            logger.warning(f"Thumbnail {size} not found for {asset_id}, serving placeholder")
-            return Response(
-                content=TRANSPARENT_1X1_PNG,
-                media_type="image/png",
-                headers={"cache-control": "public, max-age=300"},
+        stream_context = None
+        try:
+            stream_context = immich.stream_with_retry(
+                upstream_url,
+                max_retries=1,
+                headers=request_headers or None,
+                media=True,
             )
-        logger.error(f"Error proxying {size} for {asset_id}: {e}", exc_info=True)
-        raise
-    except Exception as e:
-        if stream_context is not None:
-            await stream_context.__aexit__(type(e), e, e.__traceback__)
-        logger.error(f"Error proxying {size} for {asset_id}: {e}", exc_info=True)
-        raise
+            upstream = await stream_context.__aenter__()
+
+            content_type = upstream.headers.get("content-type", "application/octet-stream")
+            if try_size == "original" and "video" not in content_type.lower() and not content_type.startswith("image/"):
+                content_type = "video/mp4"
+
+            response_headers = {}
+            passthrough_headers = ("accept-ranges", "content-range", "content-length", "etag", "last-modified", "cache-control")
+            for key in passthrough_headers:
+                value = upstream.headers.get(key)
+                if value:
+                    response_headers[key] = value
+
+            async def stream_body(ctx=stream_context):
+                try:
+                    async for chunk in upstream.aiter_bytes():
+                        if chunk:
+                            yield chunk
+                finally:
+                    if ctx is not None:
+                        await ctx.__aexit__(None, None, None)
+
+            logger.debug(f"Streaming {try_size} for {asset_id}: {content_type}")
+            return StreamingResponse(
+                stream_body(),
+                status_code=upstream.status_code,
+                media_type=content_type,
+                headers=response_headers,
+            )
+        except httpx.HTTPStatusError as e:
+            if stream_context is not None:
+                await stream_context.__aexit__(type(e), e, e.__traceback__)
+            if e.response.status_code == 404 and try_size != sizes_to_try[-1]:
+                logger.debug(f"{try_size} not found for {asset_id}, trying {sizes_to_try[sizes_to_try.index(try_size)+1]}")
+                continue
+            if e.response.status_code == 404:
+                logger.warning(f"All sizes exhausted for {asset_id}, serving placeholder")
+                return Response(
+                    content=PLACEHOLDER_PNG,
+                    media_type="image/png",
+                    headers={"cache-control": "public, max-age=60"},
+                )
+            logger.error(f"Error proxying {try_size} for {asset_id}: {e}", exc_info=True)
+            raise
+        except Exception as e:
+            if stream_context is not None:
+                await stream_context.__aexit__(type(e), e, e.__traceback__)
+            logger.error(f"Error proxying {try_size} for {asset_id}: {e}", exc_info=True)
+            raise
+
+    return Response(
+        content=PLACEHOLDER_PNG,
+        media_type="image/png",
+        headers={"cache-control": "public, max-age=60"},
+    )
 
 @app.post("/admin/seen/reset")
 async def reset_seen_assets():
