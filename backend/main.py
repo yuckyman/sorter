@@ -20,6 +20,22 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent.parent / ".env.local"
 load_dotenv(env_path)
 
+def _get_version() -> str:
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).parent.parent),
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+VERSION = _get_version()
+
 sys.path.insert(0, str(Path(__file__).parent))
 from models import (
     ActionLiteral,
@@ -621,12 +637,20 @@ async def root():
             background: var(--jade-muted);
             color: var(--jade-bright);
         }
+        
+        .version {
+            font-size: 10px;
+            color: var(--text-dim);
+            opacity: 0.5;
+            margin-left: 8px;
+            letter-spacing: 0.5px;
+        }
     </style>
 </head>
 <body>
     <div class="wrap">
         <div class="header">
-            <div class="title">sorter <span>// immich</span></div>
+            <div class="title">sorter <span>// immich</span><span class="version">""" + VERSION + """</span></div>
             <div class="header-controls">
                 <div class="smart-filter">
                     <label for="smartSelect">type:</label>
@@ -1390,6 +1414,10 @@ async def favicon():
     if favicon_path.exists():
         return FileResponse(favicon_path)
     return {"error": "favicon not found"}, 404
+
+@app.get("/version")
+async def version():
+    return {"version": VERSION}
 
 @app.get("/cameras")
 async def get_cameras():
