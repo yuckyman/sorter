@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 import sys
 import os
+import httpx
 import asyncio
 import logging
 import random
@@ -1493,6 +1494,13 @@ async def proxy_image(asset_id: str, size: str, request: Request):
     if range_header:
         request_headers["range"] = range_header
 
+    TRANSPARENT_1X1_PNG = (
+        b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01'
+        b'\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89'
+        b'\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01'
+        b'\r\n\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+    )
+
     stream_context = None
     try:
         stream_context = immich.stream_with_retry(
@@ -1502,6 +1510,7 @@ async def proxy_image(asset_id: str, size: str, request: Request):
             media=True,
         )
         upstream = await stream_context.__aenter__()
+
         content_type = upstream.headers.get("content-type", "application/octet-stream")
         if size == "original" and "video" not in content_type.lower() and not content_type.startswith("image/"):
             content_type = "video/mp4"
@@ -1529,6 +1538,18 @@ async def proxy_image(asset_id: str, size: str, request: Request):
             media_type=content_type,
             headers=response_headers,
         )
+    except httpx.HTTPStatusError as e:
+        if stream_context is not None:
+            await stream_context.__aexit__(type(e), e, e.__traceback__)
+        if e.response.status_code == 404 and size in ("thumbnail", "preview"):
+            logger.warning(f"Thumbnail {size} not found for {asset_id}, serving placeholder")
+            return Response(
+                content=TRANSPARENT_1X1_PNG,
+                media_type="image/png",
+                headers={"cache-control": "public, max-age=300"},
+            )
+        logger.error(f"Error proxying {size} for {asset_id}: {e}", exc_info=True)
+        raise
     except Exception as e:
         if stream_context is not None:
             await stream_context.__aexit__(type(e), e, e.__traceback__)

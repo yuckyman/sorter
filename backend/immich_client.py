@@ -149,11 +149,19 @@ class ImmichClient:
         except Exception:
             return {}
 
+    async def _search_random(self, size: int = 1, model: str | None = None) -> list[dict[str, Any]]:
+        body: dict[str, Any] = {"size": size, "isTrashed": False, "isArchived": False, "withExif": True}
+        if model:
+            body["model"] = model
+        r = await self._request_with_retry("POST", f"{self.base}/search/random", max_retries=1, json=body)
+        data = r.json()
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict) and item.get("id")]
+        return []
+
     async def get_unreviewed(self, limit: int = 1) -> list[dict[str, Any]]:
         if limit == 1:
-            r = await self.get_with_retry(f"{self.base}/assets/random")
-            data = r.json()
-            return data if isinstance(data, list) else [data]
+            return await self._search_random(size=1)
 
         assets: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
@@ -162,9 +170,8 @@ class ImmichClient:
 
         async def fetch_one() -> dict[str, Any] | None:
             try:
-                r = await self.get_with_retry(f"{self.base}/assets/random")
-                data = r.json()
-                return data if isinstance(data, dict) else data[0] if isinstance(data, list) else None
+                results = await self._search_random(size=1)
+                return results[0] if results else None
             except Exception:
                 return None
 
@@ -231,9 +238,8 @@ class ImmichClient:
 
         async def fetch_camera() -> str | None:
             try:
-                r = await self.get_with_retry(f"{self.base}/assets/random")
-                data = r.json()
-                asset = data if isinstance(data, dict) else data[0] if isinstance(data, list) else None
+                results = await self._search_random(size=1)
+                asset = results[0] if results else None
                 if asset:
                     exif = asset.get("exifInfo", {}) or {}
                     camera = exif.get("model")
@@ -267,9 +273,9 @@ class ImmichClient:
 
         async def fetch_and_filter() -> dict[str, Any] | None:
             try:
-                r = await self.get_with_retry(f"{self.base}/assets/random")
-                data = r.json()
-                asset = data if isinstance(data, dict) else data[0] if isinstance(data, list) else None
+                camera = next(iter(camera_set))
+                results = await self._search_random(size=1, model=camera)
+                asset = results[0] if results else None
                 if asset and asset.get("id") not in seen_ids:
                     seen_ids.add(asset.get("id"))
                     camera = (asset.get("exifInfo", {}) or {}).get("model") or "--"
